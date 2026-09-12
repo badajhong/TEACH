@@ -32,11 +32,78 @@ torch.backends.cudnn.benchmark = False
 FILE_PATH = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(FILE_PATH, "..", "cfg")
 
+
+def train_off_policy(cfg, env, policy, run, episode_stats, save, should_save):
+    """Off-policy loop (FlashSAC): every env step is stored and followed by the updates it owes.
+
+    One iteration is `cfg.algo.train_every` env steps; it is the unit for logging,
+    checkpointing and `env.set_progress`, as in the on-policy loop.
+    """
+    frames_per_batch = env.num_envs * cfg.algo.train_every
+    total_frames = cfg.get("total_frames", -1) // aa.get_world_size()
+    total_iters = total_frames // frames_per_batch
+    log_interval = (env.max_episode_length // cfg.algo.train_every) + 1
+    # also report how episodes that were not terminated ended: time limit or command (motion) finished
+    end_keys = [("stats", "episode_time_limit"), ("stats", "command_finished")]
+    episode_stats = EpisodeStats(list(episode_stats.in_keys) + end_keys, device=env.device)
+
+    carry = env.reset()
+    rollout_policy = policy.get_rollout_policy("train")
+    progress = tqdm(range(total_iters)) if aa.is_main_process() else range(total_iters)
+    env_frames = 0
+    start_iter = env.current_iter
+    for i in progress:
+        env.set_progress(start_iter + i)
+        rollout_time = training_time = 0.
+        stats_buf = []
+        for _ in range(cfg.algo.train_every):
+            rollout_start = time.perf_counter()
+            with torch.no_grad():
+                carry = rollout_policy(carry)
+                td, carry = env.step_and_maybe_reset(carry)
+                policy.add_transition(td)
+                next_td = td["next"]
+                # the env truncates on its time limit or when the command finishes
+                time_limit = next_td["step_count"] >= env.max_episode_length
+                next_td["stats", "episode_time_limit"] = time_limit.float()
+                next_td["stats", "command_finished"] = (next_td["truncated"] & ~time_limit).float()
+                stats_buf.append(td.select(("next", "done"), ("next", "stats")))
+            training_start = time.perf_counter()
+            policy.update()
+            rollout_time += training_start - rollout_start
+            training_time += time.perf_counter() - training_start
+
+        episode_stats.add(torch.stack(stats_buf, dim=1))
+        env_frames += frames_per_batch
+
+        info = {}
+        if i % log_interval == 0 and len(episode_stats):
+            for k, v in sorted(episode_stats.pop().items(True, True)):
+                key = "train/" + ("/".join(k) if isinstance(k, tuple) else k)
+                info[key] = torch.mean(v.float()).item()
+        info.update(policy.pop_info())
+        info.update(env.extra)
+        info.update(env.stats_ema)
+
+        info["env_frames"] = env_frames
+        info["rollout_fps"] = frames_per_batch / rollout_time
+        info["training_time"] = training_time
+
+        if should_save(i):
+            save(policy, f"checkpoint_{i}")
+
+        if aa.is_main_process():
+            run.log(info)
+
+
 @hydra.main(config_path=CONFIG_PATH, config_name="train", version_base=None)
 def main(cfg: DictConfig):
     OmegaConf.resolve(cfg)
     OmegaConf.set_struct(cfg, False)
-    
+    if cfg.algo.get("num_envs", None) is not None:
+        # off-policy algos fix their own number of parallel envs
+        cfg.task.num_envs = cfg.algo.num_envs
+
     print(f"is_distributed: {aa.is_distributed()}, local_rank: {aa.get_local_rank()}/{aa.get_world_size()}")
     app_launcher = AppLauncher(
         OmegaConf.to_container(cfg.app),
@@ -114,78 +181,81 @@ def main(cfg: DictConfig):
         return i > 0 and save_interval > 0 and i % save_interval == 0
 
     # 4. --- Training Loop ---
-    carry = env.reset()
-    rollout_policy: TensorDictModuleBase = policy.get_rollout_policy("train")
-
-    with torch.inference_mode():
-        tmp_carry = rollout_policy(carry.clone(False))
-        tmp_td, _ = env.step_and_maybe_reset(tmp_carry.clone(False))
-        tmp_td["next"] = tmp_td["next"].select("done", "terminated", "discount", "reward", "stats", "is_init", "adapt_hx", strict=False)
-
-    N = env.num_envs
-    T = cfg.algo.train_every
-    device = env.device
-
-    data_buf = TensorDict({}, batch_size=[N, T], device=device)
-    for key, value in tmp_td.items(include_nested=True, leaves_only=True):
-        shape_tail = value.shape[1:]
-        buf = torch.empty((N, T, *shape_tail), dtype=value.dtype, device=device)
-        data_buf.set(key, buf)
-    logging.info(f"Data buffer size: {data_buf.bytes() / 1e6:.2f} MB")
-
-    if aa.is_main_process():
-        progress = tqdm(range(total_iters))
+    if getattr(policy, "is_off_policy", False):
+        train_off_policy(cfg, env, policy, run, episode_stats, save, should_save)
     else:
-        progress = range(total_iters)
+        carry = env.reset()
+        rollout_policy: TensorDictModuleBase = policy.get_rollout_policy("train")
 
-    env_frames = 0
-    start_iter = env.current_iter
-    for i in progress:
-        rollout_start = time.perf_counter()
-        with torch.inference_mode(), set_exploration_type(ExplorationType.RANDOM):
-            torch.compiler.cudagraph_mark_step_begin() # for compiled policy
-            env.set_progress(start_iter + i)
-            for step in range(cfg.algo.train_every):
-                carry = rollout_policy(carry)
-                td, carry = env.step_and_maybe_reset(carry)
-                td["next"] = td["next"].select("done", "terminated", "discount", "reward", "stats", "is_init", "adapt_hx", strict=False)
-                data_buf[:, step] = td
-            policy.critic(data_buf)
-            values = data_buf["state_value"]
-            data_buf["next", "state_value"] = torch.where(
-                data_buf["next", "done"],
-                values, # a walkaround to avoid storing the next states
-                torch.cat([values[:, 1:], policy.critic(carry.copy())["state_value"].unsqueeze(1)], dim=1)
-            )
-        rollout_time = time.perf_counter() - rollout_start
+        with torch.inference_mode():
+            tmp_carry = rollout_policy(carry.clone(False))
+            tmp_td, _ = env.step_and_maybe_reset(tmp_carry.clone(False))
+            tmp_td["next"] = tmp_td["next"].select("done", "terminated", "discount", "reward", "stats", "is_init", "adapt_hx", strict=False)
 
-        episode_stats.add(data_buf)
-        env_frames += data_buf.numel()
+        N = env.num_envs
+        T = cfg.algo.train_every
+        device = env.device
 
-        info = {}
-        if i % log_interval == 0 and len(episode_stats):
-            for k, v in sorted(episode_stats.pop().items(True, True)):
-                key = "train/" + ("/".join(k) if isinstance(k, tuple) else k)
-                info[key] = torch.mean(v.float()).item()
-        training_start = time.perf_counter()
-        info.update(policy.train_op(data_buf))
-        training_time = time.perf_counter() - training_start
-        info.update(env.extra)
-        info.update(env.stats_ema)
-
-        if hasattr(policy, "step_schedule"):
-            policy.step_schedule(i / total_iters)
-
-        info["env_frames"] = env_frames
-        info["rollout_fps"] = data_buf.numel() / rollout_time
-        info["training_time"] = training_time
-
-        if should_save(i):
-            save(policy, f"checkpoint_{i}")
+        data_buf = TensorDict({}, batch_size=[N, T], device=device)
+        for key, value in tmp_td.items(include_nested=True, leaves_only=True):
+            shape_tail = value.shape[1:]
+            buf = torch.empty((N, T, *shape_tail), dtype=value.dtype, device=device)
+            data_buf.set(key, buf)
+        logging.info(f"Data buffer size: {data_buf.bytes() / 1e6:.2f} MB")
 
         if aa.is_main_process():
-            # print(OmegaConf.to_yaml({k: v for k, v in info.items() if (isinstance(v, (float, int)) and not k.startswith("performance_reward"))}))
-            run.log(info)
+            progress = tqdm(range(total_iters))
+        else:
+            progress = range(total_iters)
+
+        env_frames = 0
+        start_iter = env.current_iter
+        for i in progress:
+            rollout_start = time.perf_counter()
+            with torch.inference_mode(), set_exploration_type(ExplorationType.RANDOM):
+                torch.compiler.cudagraph_mark_step_begin() # for compiled policy
+                env.set_progress(start_iter + i)
+                for step in range(cfg.algo.train_every):
+                    carry = rollout_policy(carry)
+                    td, carry = env.step_and_maybe_reset(carry)
+                    td["next"] = td["next"].select("done", "terminated", "discount", "reward", "stats", "is_init", "adapt_hx", strict=False)
+                    data_buf[:, step] = td
+                policy.critic(data_buf)
+                values = data_buf["state_value"]
+                data_buf["next", "state_value"] = torch.where(
+                    data_buf["next", "done"],
+                    values, # a walkaround to avoid storing the next states
+                    torch.cat([values[:, 1:], policy.critic(carry.copy())["state_value"].unsqueeze(1)], dim=1)
+                )
+            rollout_time = time.perf_counter() - rollout_start
+
+            episode_stats.add(data_buf)
+            env_frames += data_buf.numel()
+
+            info = {}
+            if i % log_interval == 0 and len(episode_stats):
+                for k, v in sorted(episode_stats.pop().items(True, True)):
+                    key = "train/" + ("/".join(k) if isinstance(k, tuple) else k)
+                    info[key] = torch.mean(v.float()).item()
+            training_start = time.perf_counter()
+            info.update(policy.train_op(data_buf))
+            training_time = time.perf_counter() - training_start
+            info.update(env.extra)
+            info.update(env.stats_ema)
+
+            if hasattr(policy, "step_schedule"):
+                policy.step_schedule(i / total_iters)
+
+            info["env_frames"] = env_frames
+            info["rollout_fps"] = data_buf.numel() / rollout_time
+            info["training_time"] = training_time
+
+            if should_save(i):
+                save(policy, f"checkpoint_{i}")
+
+            if aa.is_main_process():
+                # print(OmegaConf.to_yaml({k: v for k, v in info.items() if (isinstance(v, (float, int)) and not k.startswith("performance_reward"))}))
+                run.log(info)
 
     # 5. --- Finalization and Cleanup ---
     if aa.is_main_process():

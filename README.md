@@ -72,6 +72,52 @@ python scripts/play.py algo=ppo_vel_finetune task=G1/vaic/skateboard_stu checkpo
 ```
 To export trained policies, add `export_policy=true` to the play script.
 
+Teacher policy with FlashSAC
+
+`flashsac_vel_train` trains the teacher with [FlashSAC](https://github.com/Holiday-Robot/FlashSAC) on the same task, rewards, observations and simulation as `ppo_vel_train`.
+
+```bash
+# train policy (uses 1024 envs)
+python scripts/train.py algo=flashsac_vel_train task=G1/vaic/skateboard_general_tracking_tea
+# evaluate policy (FlashSAC reads raw observations, so VecNorm must be off)
+python scripts/play.py algo=flashsac_vel_train task=G1/vaic/skateboard_tea vecnorm=null checkpoint_path=run:<wandb-run-path>
+```
+
+- The FlashSAC networks and update rule are vendored unmodified in `active_adaptation/learning/ppo/flashsac_upstream/` (commit and per-file sha256 in `SOURCE.json`). Hyperparameters follow upstream `scripts/run_isaaclab.sh` (1024 envs, 2 updates per env step, batch 2048, 3-step returns) except where noted: here the actor is 256 wide (`algo.actor_hidden_dim`, upstream 128) and updates start after 1M transitions (`algo.buffer_min_length`, upstream 100K).
+- The actor and the critic read the same observation, 1187 dims for the skateboard tasks: `command`, `policy`, `priv`, `object_`, `action_dr` and `ref_joint_pos_`, reduced as follows (the env still computes everything, so rewards and terminations are unchanged):
+  - `algo.obs_keys` picks the groups. The object point cloud (`object_trans`, 384 dims) is left out; add `object_trans` to use it. `action_dr` is privileged: this episode's action delay (physics substeps) and low-pass filter alpha from `JointPosition`.
+  - `algo.obs_drop_terms` removes single terms as `group/term`. By default it drops the noisy copies in `policy` of values `priv` holds without noise (`root_ang_vel_history`, `projected_gravity_history`, `joint_pos_history`, 180 dims), keeping `prev_actions`.
+  - `algo.obs_future_steps` sets which of the task's future steps `[1, 2, 8, 16, 32]` every future-reference term keeps (every term whose name contains `future`, 11 in these tasks); default `[8, 32]`, `null` keeps all.
+  - Checkpoints store this layout and refuse to load into a different one. Earlier layouts load with these overrides (both were trained with the 128-wide actor):
+    - 2748 dims (runs before the observation options): `algo.actor_hidden_dim=128 algo.obs_keys=[command,policy,priv,object_,object_trans] algo.obs_drop_terms=[] algo.obs_future_steps=null`
+    - 1320 dims (future steps `[1, 32]` on the per-body terms only): `algo.actor_hidden_dim=128 algo.obs_keys=[command,policy,priv,object_] algo.obs_future_steps=[1,32] algo.obs_future_terms=[command/ref_body_pos_future_local,priv/diff_body_pos_future_local,priv/diff_body_ori_future_local,priv/diff_body_lin_vel_future_local,priv/diff_body_ang_vel_future_local]`
+- `algo.action_mode` sets how the actor output `u = tanh(z)` becomes the joint command. `ref_joint_pos_` stays in the observation either way, and checkpoints record the mode and scale and refuse to load into a different one.
+  - `residual` (default): `action = ref_joint_pos_ + residual_scale * tanh(z)`. The policy starts on the reference motion, which is why it learns roughly twice as fast per frame early on, but it can never leave a band of `+-residual_scale` raw action units around the reference. `algo.residual_scale` defaults to 3.0; it was 1.0 until measurements on a trained `ppo_vel_flat` teacher showed that band binding — that policy commands `|action - ref_joint_pos_|` with p99 2.47 and a mean of 1.21 on both ankle pitch joints, and 94% of its control states need at least one joint beyond 1.0.
+  - `absolute`: `action = action_scale * tanh(z)`, as upstream FlashSAC, which has no reference to center on. No band, but no reference prior either, so expect a much slower start. `algo.action_scale` defaults to 4.0, covering the p99 of 2.46 for `|action|` and 1.66 for `|ref_joint_pos_|` measured on that same teacher.
+  - Note that until `algo.buffer_min_length` transitions are collected the actor is bypassed and `u` is drawn uniformly from `[-1, 1]`, so both scales also set how violent the warmup is.
+- `algo.critic_state_encoder_dim` (default `null`, i.e. the upstream critic) is a VAIC change to the FlashSAC critic: each Q head first maps the state to that many features (BatchNorm, unit linear, BatchNorm, ReLU, all upstream layers) and then concatenates the action. Without it the 23 action inputs are under 2% of the critic's first layer, while upstream tasks have 5–23%; with 128 the action is 15% of the layer where the two meet. Checkpoints record the setting and refuse to load into a different one.
+- Command completion is treated as the end of the task (no bootstrap); set `algo.bootstrap_on_command_finished=true` to bootstrap through it like a time limit.
+- Replay size is the one setting limited by hardware. Observations are stored as float16 (`algo.buffer_obs_dtype`), and the default `algo.buffer_max_length=6000000` takes 13.9 GiB of GPU memory: 12% of a 50M-frame run and 0.75% of the default 800M. Upstream IsaacLab keeps 10M transitions, 20% of its 50M-step runs. Memory scales with rows x observation dims, so revisit the buffer length when changing the observation options.
+- `algo.buffer_device_type=cpu` keeps the replay in RAM instead (10M rows take 23 GiB at 1187 dims); batches are staged through pinned memory to the GPU, which made training about 5% slower in a 1024-env run. The run checks the available RAM before allocating.
+- Besides the usual episode statistics, the off-policy loop logs how non-terminated episodes ended: `train/stats/episode_time_limit` and `train/stats/command_finished` (fractions of finished episodes).
+- The learning-rate schedule spans `total_frames`; upstream IsaacLab runs use `total_frames=50_000_896`.
+
+Teacher policy with PPO on the FlashSAC observation
+
+`ppo_vel_flat_train` isolates the effect of the input: PPO with `ppo_vel`'s networks, sizes and hyperparameters, reading the single flat vector `flashsac_vel_train` builds instead of `ppo_vel_train`'s grouped tensors and adaptation modules.
+
+```bash
+python scripts/train.py algo=ppo_vel_flat_train task=G1/vaic/skateboard_general_tracking_tea
+python scripts/play.py algo=ppo_vel_flat_train task=G1/vaic/skateboard_general_tracking_tea checkpoint_path=run:<wandb-run-path>
+```
+
+- `active_adaptation/learning/ppo/ppo_vel_flat.py` is self-contained: it imports nothing from `ppo_vel.py` or `flashsac_vel.py`, so either can change without affecting it (and the observation options are duplicated there, not shared).
+- The observation is the one described above and uses the same option names (`algo.obs_keys`, `algo.obs_drop_terms`, `algo.obs_future_steps`, `algo.obs_future_terms`), 1187 dims by default. Checkpoints store the selected indices and refuse to load into a different selection.
+- Actor `[512, 256, 256]`, critic `[512, 256, 128]`, one value head per reward group, `lr=3e-4` with the `desired_kl=0.01` adaptive schedule, 3 epochs x 8 minibatches, `clip_param=0.2`, `gamma=0.99`, `lmbda=0.95` — all as in `ppo_vel`.
+- The actor emits the joint command directly (`action = loc`), like `ppo_vel_finetune`, not as a residual on `ref_joint_pos_` like `ppo_vel_train` and `flashsac_vel_train`. `ref_joint_pos_` is still the last block of the observation.
+- `vecnorm` defaults to `train`: PPO reads raw-scale observations and needs the running normalizer, where FlashSAC's BatchNorm embedder does that job itself.
+- The number of envs comes from the task (unlike `flashsac_vel_train`, which fixes 1024); pass `task.num_envs=1024` to match FlashSAC's rollout width.
+
 
 ## Acknowledgments
 
