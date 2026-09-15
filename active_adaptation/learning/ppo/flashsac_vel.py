@@ -138,9 +138,10 @@ class FlashSACVelConfig:
 
     critic_num_blocks: int = 2
     critic_hidden_dim: int = 256
-    # VAIC additions. Each Q head projects the state (BN -> unit linear) and action (unit linear)
-    # before concatenation. The original FlashSAC embedder then applies BN -> unit linear to the
-    # balanced features. Set both to null to restore the unmodified upstream critic input.
+    # VAIC additions. Each Q head projects the state (BN -> unit linear -> ReLU) and action
+    # (unit linear -> ReLU) before concatenation. The original FlashSAC embedder then applies
+    # BN -> unit linear to the balanced features. Set both to null to restore the unmodified
+    # upstream critic input.
     #   critic_state_encoder_dim shrinks the state so it does not outweigh the action by count.
     #   critic_action_encoder_dim expands the bounded action before fusion. Setting both encoder
     #     dimensions equally gives state and action equal representation in the original shared
@@ -376,9 +377,10 @@ class EncoderDoubleCritic(FlashSACDoubleCritic):
     imbalance at the original FlashSAC fusion BatchNorm.
 
     State is normalized before its projection because it contains raw observations with mixed
-    scales. Action is already bounded by tanh, so it is projected directly. There is deliberately
-    no branch output BatchNorm or ReLU: the original FlashSAC embedder immediately after
-    concatenation supplies BN -> unit linear, and the original residual trunk remains unchanged.
+    scales. Action is already bounded by tanh, so it is projected directly. ReLU after each
+    projection turns the widened branches into nonlinear features; there is deliberately no
+    branch-output BatchNorm because the original FlashSAC embedder immediately after concatenation
+    supplies BN -> unit linear. The original residual trunk remains unchanged.
     """
 
     def __init__(
@@ -400,10 +402,10 @@ class EncoderDoubleCritic(FlashSACDoubleCritic):
     def forward(self, observations, actions, training):
         s = observations.unsqueeze(0).expand(self.num_qs, -1, -1)  # [num_qs, B, state_dim]
         if self.state_projection is not None:
-            s = self.state_projection(self.state_norm(s, training))
+            s = torch.relu(self.state_projection(self.state_norm(s, training)))
         a = actions.unsqueeze(0).expand(self.num_qs, -1, -1)
         if self.action_projection is not None:
-            a = self.action_projection(a)
+            a = torch.relu(self.action_projection(a))
         x = self.embedder(torch.cat((s, a), dim=-1), training)
         for block in self.encoder:
             x = block(x, training)
@@ -787,7 +789,7 @@ class FlashSACVel(TensorDictModuleBase):
         state_dict["obs_layout"] = self.obs_layout
         state_dict["critic_state_encoder_dim"] = self.cfg.critic_state_encoder_dim
         state_dict["critic_action_encoder_dim"] = self.cfg.critic_action_encoder_dim
-        state_dict["critic_encoder_arch"] = "linear_branches_v1"
+        state_dict["critic_encoder_arch"] = "relu_branches_v1"
         state_dict["action_seam"] = self._action_seam()
         return state_dict
 
@@ -826,11 +828,11 @@ class FlashSACVel(TensorDictModuleBase):
                 )
         uses_encoder = self.cfg.critic_state_encoder_dim or self.cfg.critic_action_encoder_dim
         saved_encoder_arch = state_dict.get("critic_encoder_arch")
-        if uses_encoder and saved_encoder_arch != "linear_branches_v1":
+        if uses_encoder and saved_encoder_arch != "relu_branches_v1":
             raise ValueError(
-                "checkpoint critic uses the legacy BN/Linear/BN/ReLU branch encoder, but the current critic "
-                "uses linear_branches_v1 (state: BN/Linear; action: Linear). These parameterizations are not "
-                "checkpoint-compatible; start a fresh run or use a checkpoint created with the current code."
+                f"checkpoint critic encoder architecture is {saved_encoder_arch or 'legacy'}, but the current "
+                "critic uses relu_branches_v1 (state: BN/Linear/ReLU; action: Linear/ReLU). These architectures "
+                "are not checkpoint-compatible; start a fresh run or use a checkpoint created with the current code."
             )
         # in-place loads keep the parameter tensors that the compiled EMA and weight-norm functions hold
         for name, network in self._networks().items():
