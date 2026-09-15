@@ -20,7 +20,6 @@ from typing import List, Optional, Union
 from unittest import mock
 
 import torch
-import torch.nn.functional as F
 from hydra.core.config_store import ConfigStore
 from omegaconf import II
 from tensordict import TensorDictBase
@@ -48,7 +47,7 @@ from .flashsac_upstream.agent import (
     _sample_flashsac_actions,
     _update_networks,
 )
-from .flashsac_upstream.layer import EnsembleFlashSACEmbedder, EnsembleUnitBatchNorm
+from .flashsac_upstream.layer import EnsembleUnitBatchNorm, EnsembleUnitLinear
 from .flashsac_upstream.network import FlashSACDoubleCritic
 from .flashsac_upstream.reward_normalization import RewardNormalizer
 
@@ -139,16 +138,16 @@ class FlashSACVelConfig:
 
     critic_num_blocks: int = 2
     critic_hidden_dim: int = 256
-    # VAIC additions, both off (null) in upstream FlashSAC. Each Q head can embed the state and/or
-    # the action (BN -> unit linear -> BN -> ReLU) before the two are concatenated.
+    # VAIC additions. Each Q head projects the state (BN -> unit linear) and action (unit linear)
+    # before concatenation. The original FlashSAC embedder then applies BN -> unit linear to the
+    # balanced features. Set both to null to restore the unmodified upstream critic input.
     #   critic_state_encoder_dim shrinks the state so it does not outweigh the action by count.
-    #   critic_action_encoder_dim gives the action its own UnitBatchNorm. This matters because
-    #     upstream renormalizes each BatchNorm's scale and bias to sqrt(d) after every update, so
-    #     all of its inputs share one fixed budget; with a 1187-dim state the 23 action inputs are
-    #     squeezed out of it (measured on a converged run: 0.15x their share at initialization).
-    #     Shrinking the state alone does not help, since the two still share one budget.
-    critic_state_encoder_dim: Optional[int] = None
-    critic_action_encoder_dim: Optional[int] = None
+    #   critic_action_encoder_dim expands the bounded action before fusion. Setting both encoder
+    #     dimensions equally gives state and action equal representation in the original shared
+    #     BatchNorm; without projection, the 1187-dim state can squeeze the 23 action inputs out
+    #     of its learned scale budget (measured on a converged run: 0.15x their initial share).
+    critic_state_encoder_dim: Optional[int] = 256
+    critic_action_encoder_dim: Optional[int] = 256
     critic_num_bins: int = 101
     critic_target_update_tau: float = 0.01
 
@@ -365,7 +364,7 @@ class NStepTrajectoryReplay:
 
 
 class EncoderDoubleCritic(FlashSACDoubleCritic):
-    """FlashSAC double critic that embeds the state and/or the action before joining them.
+    """FlashSAC double critic with optional linear state/action projections before fusion.
 
     Upstream feeds `cat(state, action)` into one UnitBatchNorm whose scale and bias are
     renormalized to sqrt(d) after every update, so every input dimension draws on one fixed
@@ -373,11 +372,13 @@ class EncoderDoubleCritic(FlashSACDoubleCritic):
     a converged run, the action's share of the first layer had fallen to 0.15x its value at
     initialization (its BatchNorm scale 0.235 against the state's 0.761). Raising the action's
     share by shrinking the state alone does not survive training, because the two still share
-    one budget. Giving the action its own embedder puts it on a budget of its own.
+    one budget. Projecting both branches to balanced feature counts removes that dimensional
+    imbalance at the original FlashSAC fusion BatchNorm.
 
-    Built only from upstream layers: an embedder (BatchNorm -> unit linear) followed by
-    BatchNorm and ReLU, as inside a FlashSAC block. Everything after the concatenation is the
-    upstream critic.
+    State is normalized before its projection because it contains raw observations with mixed
+    scales. Action is already bounded by tanh, so it is projected directly. There is deliberately
+    no branch output BatchNorm or ReLU: the original FlashSAC embedder immediately after
+    concatenation supplies BN -> unit linear, and the original residual trunk remains unchanged.
     """
 
     def __init__(
@@ -388,22 +389,21 @@ class EncoderDoubleCritic(FlashSACDoubleCritic):
         state_out = state_feature_dim or state_dim
         action_out = action_feature_dim or action_dim
         super().__init__(num_blocks, state_out + action_out, hidden_dim, num_bins, min_v, max_v, num_qs)
-        self.state_embedder = self.state_norm = None
+        self.state_norm = self.state_projection = None
         if state_feature_dim:
-            self.state_embedder = EnsembleFlashSACEmbedder(num_qs, state_dim, state_feature_dim)
-            self.state_norm = EnsembleUnitBatchNorm(num_qs, state_feature_dim)
-        self.action_embedder = self.action_norm = None
+            self.state_norm = EnsembleUnitBatchNorm(num_qs, state_dim)
+            self.state_projection = EnsembleUnitLinear(num_qs, state_dim, state_feature_dim)
+        self.action_projection = None
         if action_feature_dim:
-            self.action_embedder = EnsembleFlashSACEmbedder(num_qs, action_dim, action_feature_dim)
-            self.action_norm = EnsembleUnitBatchNorm(num_qs, action_feature_dim)
+            self.action_projection = EnsembleUnitLinear(num_qs, action_dim, action_feature_dim)
 
     def forward(self, observations, actions, training):
         s = observations.unsqueeze(0).expand(self.num_qs, -1, -1)  # [num_qs, B, state_dim]
-        if self.state_embedder is not None:
-            s = F.relu(self.state_norm(self.state_embedder(s, training), training))
+        if self.state_projection is not None:
+            s = self.state_projection(self.state_norm(s, training))
         a = actions.unsqueeze(0).expand(self.num_qs, -1, -1)
-        if self.action_embedder is not None:
-            a = F.relu(self.action_norm(self.action_embedder(a, training), training))
+        if self.action_projection is not None:
+            a = self.action_projection(a)
         x = self.embedder(torch.cat((s, a), dim=-1), training)
         for block in self.encoder:
             x = block(x, training)
@@ -787,6 +787,7 @@ class FlashSACVel(TensorDictModuleBase):
         state_dict["obs_layout"] = self.obs_layout
         state_dict["critic_state_encoder_dim"] = self.cfg.critic_state_encoder_dim
         state_dict["critic_action_encoder_dim"] = self.cfg.critic_action_encoder_dim
+        state_dict["critic_encoder_arch"] = "linear_branches_v1"
         state_dict["action_seam"] = self._action_seam()
         return state_dict
 
@@ -823,6 +824,14 @@ class FlashSACVel(TensorDictModuleBase):
                     f"checkpoint critic was trained with {option}={saved}, the current option is "
                     f"{getattr(self.cfg, option)}; set algo.{option}={'null' if saved is None else saved}."
                 )
+        uses_encoder = self.cfg.critic_state_encoder_dim or self.cfg.critic_action_encoder_dim
+        saved_encoder_arch = state_dict.get("critic_encoder_arch")
+        if uses_encoder and saved_encoder_arch != "linear_branches_v1":
+            raise ValueError(
+                "checkpoint critic uses the legacy BN/Linear/BN/ReLU branch encoder, but the current critic "
+                "uses linear_branches_v1 (state: BN/Linear; action: Linear). These parameterizations are not "
+                "checkpoint-compatible; start a fresh run or use a checkpoint created with the current code."
+            )
         # in-place loads keep the parameter tensors that the compiled EMA and weight-norm functions hold
         for name, network in self._networks().items():
             _raw(network).load_state_dict(state_dict[name], strict=strict)
