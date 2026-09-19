@@ -111,7 +111,7 @@ class FlashSACVelConfig:
     updates_per_interaction_step: float = 2.0
     gamma: float = 0.99
     n_step: int = 3
-    buffer_max_length: int = 6_000_000  # upstream IsaacLab uses 10_000_000; see the README
+    buffer_max_length: int = 10_000_000  # upstream IsaacLab uses 10_000_000; see the README
     buffer_obs_dtype: str = "float16"  # storage only; batches are cast back to float32
     # "cpu" keeps the replay in RAM (as upstream does for CPU simulators); batches still train on the GPU
     buffer_device_type: str = "cuda"
@@ -123,9 +123,9 @@ class FlashSACVelConfig:
     normalize_reward: bool = True
     normalized_G_max: float = 5.0
 
-    learning_rate_init: float = 3e-4
-    learning_rate_peak: float = 3e-4
-    learning_rate_end: float = 1.5e-4
+    learning_rate_init: float = 1e-4    #3e-4
+    learning_rate_peak: float = 1e-4    #3e-4
+    learning_rate_end: float = 1e-4     #1.5e-4
     learning_rate_warmup_rate: float = 1e-6
     learning_rate_decay_rate: float = 1.0
 
@@ -153,7 +153,7 @@ class FlashSACVelConfig:
     critic_target_update_tau: float = 0.01
 
     temp_initial_value: float = 0.01
-    temp_target_sigma: float = 0.15
+    temp_target_sigma: float = 0.09 # flashsac: 0.15 but 0.09 was optimal for VAIC
 
     use_compile: bool = True
     compile_mode: str = "auto"

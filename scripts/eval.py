@@ -61,6 +61,13 @@ def main(cfg: DictConfig):
     info["task"] = cfg.task.name
     info["algo"] = cfg.algo.name
     info["checkpoint_path"] = cfg.checkpoint_path
+    info["seed"] = cfg.seed
+    info["num_envs"] = env.num_envs
+    info["action_settings"] = {
+        key: OmegaConf.to_container(cfg.task.action, resolve=True)[key]
+        for key in ("min_delay", "max_delay", "alpha")
+        if key in cfg.task.action
+    }
     info["argv"] = sys.argv
     print(OmegaConf.to_yaml(info))
     
@@ -79,4 +86,3 @@ def main(cfg: DictConfig):
 
 if __name__ == "__main__":
     main()
-

@@ -80,10 +80,10 @@ Teacher policy with FlashSAC
 # train policy (uses 1024 envs)
 python scripts/train.py algo=flashsac_vel_train task=G1/vaic/skateboard_general_tracking_tea
 # evaluate policy (FlashSAC reads raw observations, so VecNorm must be off)
-python scripts/play.py algo=flashsac_vel_train task=G1/vaic/skateboard_tea vecnorm=null checkpoint_path=run:<wandb-run-path>
+python scripts/play.py algo=flashsac_vel_train task=G1/vaic/skateboard_general_tracking_tea vecnorm=null checkpoint_path=run:<wandb-run-path>
 ```
 
-- The FlashSAC networks and update rule are vendored unmodified in `active_adaptation/learning/ppo/flashsac_upstream/` (commit and per-file sha256 in `SOURCE.json`). Hyperparameters follow upstream `scripts/run_isaaclab.sh` (1024 envs, 2 updates per env step, batch 2048, 3-step returns) except where noted: here the actor is 256 wide (`algo.actor_hidden_dim`, upstream 128) and updates start after 1M transitions (`algo.buffer_min_length`, upstream 100K).
+- The FlashSAC networks and update rule are vendored unmodified in `active_adaptation/learning/ppo/flashsac_upstream/` (commit and per-file sha256 in `SOURCE.json`). Hyperparameters follow upstream `scripts/run_isaaclab.sh` (1024 envs, 2 updates per env step, batch 2048, 3-step returns) except where noted: here the actor is 256 wide (`algo.actor_hidden_dim`, upstream 128). Updates start after 100K transitions (`algo.buffer_min_length`).
 - The actor and the critic read the same observation, 1187 dims for the skateboard tasks: `command`, `policy`, `priv`, `object_`, `action_dr` and `ref_joint_pos_`, reduced as follows (the env still computes everything, so rewards and terminations are unchanged):
   - `algo.obs_keys` picks the groups. The object point cloud (`object_trans`, 384 dims) is left out; add `object_trans` to use it. `action_dr` is privileged: this episode's action delay (physics substeps) and low-pass filter alpha from `JointPosition`.
   - `algo.obs_drop_terms` removes single terms as `group/term`. By default it drops the noisy copies in `policy` of values `priv` holds without noise (`root_ang_vel_history`, `projected_gravity_history`, `joint_pos_history`, 180 dims), keeping `prev_actions`.
@@ -96,11 +96,21 @@ python scripts/play.py algo=flashsac_vel_train task=G1/vaic/skateboard_tea vecno
   - `absolute`: `action = action_scale * tanh(z)`, as upstream FlashSAC, which has no reference to center on. No band, but no reference prior either, so expect a much slower start. `algo.action_scale` defaults to 4.0, covering the p99 of 2.46 for `|action|` and 1.66 for `|ref_joint_pos_|` measured on that same teacher.
   - Note that until `algo.buffer_min_length` transitions are collected the actor is bypassed and `u` is drawn uniformly from `[-1, 1]`, so both scales also set how violent the warmup is.
 - `algo.critic_state_encoder_dim` and `algo.critic_action_encoder_dim` (both default `256`) balance the inputs to the FlashSAC critic. Each Q head maps state with `BatchNorm -> unit linear -> ReLU` and action with `unit linear -> ReLU`, then concatenates the branch features. There is no branch-output BatchNorm; the original FlashSAC embedder applies `BatchNorm -> unit linear` immediately after concatenation and the rest of its critic is unchanged. The defaults change the 1187-state/23-action fusion into 256 state features plus 256 action features; set both options to `null` to restore the upstream critic. Checkpoints record both dimensions and the encoder architecture; checkpoints from the earlier branch encoders are not compatible.
-- Command completion is treated as the end of the task (no bootstrap); set `algo.bootstrap_on_command_finished=true` to bootstrap through it like a time limit.
-- Replay size is the one setting limited by hardware. Observations are stored as float16 (`algo.buffer_obs_dtype`), and the default `algo.buffer_max_length=6000000` takes 13.9 GiB of GPU memory: 12% of a 50M-frame run and 0.75% of the default 800M. Upstream IsaacLab keeps 10M transitions, 20% of its 50M-step runs. Memory scales with rows x observation dims, so revisit the buffer length when changing the observation options.
+- Command completion bootstraps like a time limit by default (`algo.bootstrap_on_command_finished=true`), matching this PPO implementation. Set it to `false` to treat command completion as terminal.
+- Replay size is the one setting limited by hardware. Observations are stored as float16 (`algo.buffer_obs_dtype`), and the default `algo.buffer_max_length=6000000` takes 13.9 GiB of GPU memory: 12% of a 50M-frame run and 0.375% of the default 1.6B. Upstream IsaacLab keeps 10M transitions, 20% of its 50M-step runs. Memory scales with rows x observation dims, so revisit the buffer length when changing the observation options.
 - `algo.buffer_device_type=cpu` keeps the replay in RAM instead (10M rows take 23 GiB at 1187 dims); batches are staged through pinned memory to the GPU, which made training about 5% slower in a 1024-env run. The run checks the available RAM before allocating.
 - Besides the usual episode statistics, the off-policy loop logs how non-terminated episodes ended: `train/stats/episode_time_limit` and `train/stats/command_finished` (fractions of finished episodes).
 - The learning-rate schedule spans `total_frames`; upstream IsaacLab runs use `total_frames=50_000_896`.
+
+Actuator settings are part of the training distribution. A policy trained with
+`task.action.min_delay=0 task.action.max_delay=0 task.action.alpha=1.0` has constant
+`action_dr` inputs. Their BatchNorm variance can approach zero, making evaluation
+with the task's default delay (2–6 physics substeps) and alpha (0.8–1.0) fail even
+when tracking with the training actuator works well. Checkpoint loading now logs
+these mismatches. To transfer an existing policy, see the measured
+[default-delay investigation](diagnostics/flashsac_improve_20260918/REPORT.md) and
+[fine-tuning/evaluation commands](diagnostics/flashsac_improve_20260918/REPRODUCE.md).
+The experiment keeps the task's default physics, rewards, and termination rules.
 
 Teacher policy with PPO on the FlashSAC observation
 

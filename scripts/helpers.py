@@ -134,6 +134,21 @@ def make_env_policy(cfg: DictConfig):
     checkpoint_path = parse_checkpoint_path(cfg.checkpoint_path)
     if checkpoint_path is not None:
         state_dict = torch.load(checkpoint_path, weights_only=False)
+        saved_cfg = state_dict.get("cfg") or {}
+        saved_action = (saved_cfg.get("task") or {}).get("action") or {}
+        current_action = cfg.task.get("action", {})
+        differences = {
+            key: {"checkpoint": saved_action[key], "current": current_action.get(key)}
+            for key in ("min_delay", "max_delay", "alpha")
+            if key in saved_action and saved_action[key] != current_action.get(key)
+        }
+        if differences:
+            logging.warning(
+                "Checkpoint actuator settings differ from the current task: %s. "
+                "This changes both the dynamics and action_dr observations; "
+                "use matching settings for an in-distribution evaluation, or "
+                "explicitly fine-tune for the new actuator settings.", differences,
+            )
     else:
         state_dict = {}
     
@@ -245,6 +260,8 @@ def evaluate(
     trajs: TensorDictBase = torch.stack(trajs, dim=1)
     done = trajs.get(("next", "done"))
     episode_cnt = len(done.nonzero())
+    if not done.any(dim=1).all():
+        raise RuntimeError("Evaluation horizon ended before every environment completed its first episode")
     first_done = torch.argmax(done.long(), dim=1).cpu()
 
     def take_first_episode(tensor: torch.Tensor):
@@ -281,6 +298,8 @@ def evaluate(
         )
 
     info["episode_cnt"] = episode_cnt
+    # Statistics above use one episode per environment, not every episode counted.
+    info["evaluated_episodes"] = env.num_envs
     return dict(sorted(info.items())), trajs, stats, policy_trajs
 
 
@@ -376,4 +395,3 @@ def plot_obs_histogram(
     plt.tight_layout()
     plt.savefig(os.path.join(os.path.dirname(__file__), "trajs_obs_hist.png"))
     plt.close()
-    
