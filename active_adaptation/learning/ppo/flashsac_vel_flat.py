@@ -1,4 +1,4 @@
-"""FlashSAC teacher on VAIC tasks.
+"""FlashSAC teacher using one flat actor/critic observation on VAIC tasks.
 
 The network architecture and the update rule are FlashSAC's and come unmodified from the
 vendored upstream code in `flashsac_upstream/`; rewards, observations, simulation, resets
@@ -57,9 +57,9 @@ ACTION_DR_KEY = "action_dr"
 
 
 @dataclass
-class FlashSACVelConfig:
-    _target_: str = "active_adaptation.learning.ppo.flashsac_vel.FlashSACVel"
-    name: str = "flashsac_vel"
+class FlashSACVelFlatConfig:
+    _target_: str = "active_adaptation.learning.ppo.flashsac_vel_flat.FlashSACVelFlat"
+    name: str = "flashsac_vel_flat"
     # FlashSAC normalizes its inputs with the BatchNorm embedder, so it consumes raw observations
     vecnorm: Union[str, None] = None
     # obs groups the env builds (same as ppo_vel_train) ...
@@ -161,7 +161,7 @@ class FlashSACVelConfig:
 
 
 cs = ConfigStore.instance()
-cs.store("flashsac_vel_train", node=FlashSACVelConfig, group="algo")
+cs.store("flashsac_vel_flat_train", node=FlashSACVelFlatConfig, group="algo")
 
 
 # Sampling from RAM runs right after the updates wait on the GPU, when the intra-op thread pool
@@ -414,7 +414,7 @@ class EncoderDoubleCritic(FlashSACDoubleCritic):
 
 
 class FlashSACRollout(TensorDictModuleBase):
-    def __init__(self, policy: "FlashSACVel", mode: str):
+    def __init__(self, policy: "FlashSACVelFlat", mode: str):
         super().__init__()
         object.__setattr__(self, "policy", policy)
         self.deterministic = mode != "train"
@@ -440,10 +440,10 @@ def _raw(network):
     return getattr(network.network, "_orig_mod", network.network)
 
 
-class FlashSACVel(TensorDictModuleBase):
+class FlashSACVelFlat(TensorDictModuleBase):
     is_off_policy = True
 
-    def __init__(self, cfg: FlashSACVelConfig, observation_spec, action_spec, reward_spec, device, env):
+    def __init__(self, cfg: FlashSACVelFlatConfig, observation_spec, action_spec, reward_spec, device, env):
         super().__init__()
         self.cfg = cfg
         if cfg.action_mode not in ("residual", "absolute"):

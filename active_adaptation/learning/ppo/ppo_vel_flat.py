@@ -1,18 +1,18 @@
 """PPO teacher on the flat FlashSAC observation.
 
 The networks, their sizes and the PPO hyperparameters are ppo_vel's; the input is the one
-`flashsac_vel_train` builds -- a single flat vector, shared by the actor and the critic,
+`flashsac_vel_flat_train` builds -- a single flat vector, shared by the actor and the critic,
 assembled from the same observation groups with the same `obs_keys` / `obs_drop_terms` /
 `obs_future_steps` options. The adaptation modules of ppo_vel (student actor, GRU adapt
 module, object and depth encoders) have no place here and are left out: one actor, one
 critic, one input.
 
-Unlike ppo_vel_train and flashsac_vel_train the actor emits the joint command directly
+Unlike ppo_vel_train and flashsac_vel_flat_train the actor emits the joint command directly
 (`action = loc`), as ppo_vel_finetune does, instead of a residual on `ref_joint_pos_`;
 `ref_joint_pos_` is still the last block of the observation.
 
 This module is deliberately self-contained: nothing is imported from ppo_vel.py or
-flashsac_vel.py, so it can be changed without touching either of them.
+flashsac_vel_flat.py, so it can be changed without touching either of them.
 """
 import math
 import warnings
@@ -66,7 +66,7 @@ class PPOVelFlatConfig:
     _target_: str = "active_adaptation.learning.ppo.ppo_vel_flat.PPOVelFlat"
     name: str = "ppo_vel_flat"
 
-    # --- observation, as in flashsac_vel_train -------------------------------------------
+    # --- observation, as in flashsac_vel_flat_train --------------------------------------
     # obs groups the env builds
     in_keys: List[str] = (CMD_KEY, OBS_KEY, OBJECT_KEY, OBS_PRIV_KEY, OBJECT_GEO_KEY, HEIGHT_KEY, VEL_CMD_KEY)
     # ... and the ones concatenated into the shared actor/critic input. Groups the task does not

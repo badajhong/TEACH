@@ -72,15 +72,15 @@ python scripts/play.py algo=ppo_vel_finetune task=G1/vaic/skateboard_stu checkpo
 ```
 To export trained policies, add `export_policy=true` to the play script.
 
-Teacher policy with FlashSAC
+Teacher policy with FlashSAC on the flat observation
 
-`flashsac_vel_train` trains the teacher with [FlashSAC](https://github.com/Holiday-Robot/FlashSAC) on the same task, rewards, observations and simulation as `ppo_vel_train`.
+`flashsac_vel_flat_train` trains the teacher with [FlashSAC](https://github.com/Holiday-Robot/FlashSAC) on the same task, rewards, observations and simulation as `ppo_vel_train`. The `flat` suffix indicates that its actor and critic share one flat observation vector.
 
 ```bash
 # train policy (uses 1024 envs)
-python scripts/train.py algo=flashsac_vel_train task=G1/vaic/skateboard_general_tracking_tea
+python scripts/train.py algo=flashsac_vel_flat_train task=G1/vaic/skateboard_general_tracking_tea
 # evaluate policy (FlashSAC reads raw observations, so VecNorm must be off)
-python scripts/play.py algo=flashsac_vel_train task=G1/vaic/skateboard_general_tracking_tea vecnorm=null checkpoint_path=run:<wandb-run-path>
+python scripts/play.py algo=flashsac_vel_flat_train task=G1/vaic/skateboard_general_tracking_tea vecnorm=null checkpoint_path=run:<wandb-run-path>
 ```
 
 - The FlashSAC networks and update rule are vendored unmodified in `active_adaptation/learning/ppo/flashsac_upstream/` (commit and per-file sha256 in `SOURCE.json`). Hyperparameters follow upstream `scripts/run_isaaclab.sh` (1024 envs, 2 updates per env step, batch 2048, 3-step returns) except where noted: here the actor is 256 wide (`algo.actor_hidden_dim`, upstream 128). Updates start after 100K transitions (`algo.buffer_min_length`).
@@ -114,19 +114,19 @@ The experiment keeps the task's default physics, rewards, and termination rules.
 
 Teacher policy with PPO on the FlashSAC observation
 
-`ppo_vel_flat_train` isolates the effect of the input: PPO with `ppo_vel`'s networks, sizes and hyperparameters, reading the single flat vector `flashsac_vel_train` builds instead of `ppo_vel_train`'s grouped tensors and adaptation modules.
+`ppo_vel_flat_train` isolates the effect of the input: PPO with `ppo_vel`'s networks, sizes and hyperparameters, reading the single flat vector `flashsac_vel_flat_train` builds instead of `ppo_vel_train`'s grouped tensors and adaptation modules.
 
 ```bash
 python scripts/train.py algo=ppo_vel_flat_train task=G1/vaic/skateboard_general_tracking_tea
 python scripts/play.py algo=ppo_vel_flat_train task=G1/vaic/skateboard_general_tracking_tea checkpoint_path=run:<wandb-run-path>
 ```
 
-- `active_adaptation/learning/ppo/ppo_vel_flat.py` is self-contained: it imports nothing from `ppo_vel.py` or `flashsac_vel.py`, so either can change without affecting it (and the observation options are duplicated there, not shared).
+- `active_adaptation/learning/ppo/ppo_vel_flat.py` is self-contained: it imports nothing from `ppo_vel.py` or `flashsac_vel_flat.py`, so either can change without affecting it (and the observation options are duplicated there, not shared).
 - The observation is the one described above and uses the same option names (`algo.obs_keys`, `algo.obs_drop_terms`, `algo.obs_future_steps`, `algo.obs_future_terms`), 1187 dims by default. Checkpoints store the selected indices and refuse to load into a different selection.
 - Actor `[512, 256, 256]`, critic `[512, 256, 128]`, one value head per reward group, `lr=3e-4` with the `desired_kl=0.01` adaptive schedule, 3 epochs x 8 minibatches, `clip_param=0.2`, `gamma=0.99`, `lmbda=0.95` — all as in `ppo_vel`.
-- The actor emits the joint command directly (`action = loc`), like `ppo_vel_finetune`, not as a residual on `ref_joint_pos_` like `ppo_vel_train` and `flashsac_vel_train`. `ref_joint_pos_` is still the last block of the observation.
+- The actor emits the joint command directly (`action = loc`), like `ppo_vel_finetune`, not as a residual on `ref_joint_pos_` like `ppo_vel_train` and `flashsac_vel_flat_train`. `ref_joint_pos_` is still the last block of the observation.
 - `vecnorm` defaults to `train`: PPO reads raw-scale observations and needs the running normalizer, where FlashSAC's BatchNorm embedder does that job itself.
-- The number of envs comes from the task (unlike `flashsac_vel_train`, which fixes 1024); pass `task.num_envs=1024` to match FlashSAC's rollout width.
+- The number of envs comes from the task (unlike `flashsac_vel_flat_train`, which fixes 1024); pass `task.num_envs=1024` to match FlashSAC's rollout width.
 
 
 ## Acknowledgments
