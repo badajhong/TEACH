@@ -82,7 +82,7 @@ class FlashSACVelFlatConfig:
     # (only needed to reload checkpoints with an older layout, see the README)
     obs_future_terms: Optional[List[str]] = None
 
-    num_envs: int = 1024  # replaces task.num_envs; upstream scripts/run_isaaclab.sh num_train_envs
+    num_envs: int = 4096  # replaces task.num_envs; upstream scripts/run_isaaclab.sh num_train_envs
     train_every: int = 32  # env steps per train.py iteration (logging and checkpoint unit only)
     num_env_steps: int = II("oc.select:total_frames,-1")  # sets the learning-rate schedule length
 
@@ -108,7 +108,7 @@ class FlashSACVelFlatConfig:
 
     # FlashSAC hyperparameters: configs/agent/flashSAC.yaml, with the scripts/run_isaaclab.sh
     # overrides for updates_per_interaction_step, n_step, buffer_max_length and buffer_min_length.
-    updates_per_interaction_step: float = 2.0
+    updates_per_interaction_step: float = 8.0
     gamma: float = 0.99
     n_step: int = 3
     buffer_max_length: int = 10_000_000  # upstream IsaacLab uses 10_000_000; see the README

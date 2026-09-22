@@ -112,6 +112,54 @@ these mismatches. To transfer an existing policy, see the measured
 [fine-tuning/evaluation commands](diagnostics/flashsac_improve_20260918/REPRODUCE.md).
 The experiment keeps the task's default physics, rewards, and termination rules.
 
+Teacher policy with VAIC adaptation and FlashSAC
+
+`flashsac_vel_train` keeps the privileged encoder, GRU adaptation module, object estimator,
+and `actor_adapt` interfaces from `ppo_vel_train`. Its teacher actor and critic use the
+FlashSAC architecture and update rule. The actor reads `[command, policy, priv_feature]`;
+the critic keeps the flat observation described above.
+
+```bash
+python scripts/train.py algo=flashsac_vel_train task=G1/vaic/skateboard_general_tracking_tea
+```
+
+The replay buffer is stored in CPU RAM by default. The equivalent explicit command is:
+
+```bash
+python scripts/train.py \
+  algo=flashsac_vel_train \
+  task=G1/vaic/skateboard_general_tracking_tea \
+  algo.buffer_device_type=cpu
+```
+
+Use `algo.buffer_device_type=cuda` to keep it on the GPU instead.
+
+- Long-term replay stores full `command` and `policy`, the critic-selected subset of `priv`,
+  and the remaining critic fields. Every sampled
+  current and bootstrap observation is passed through the latest encoder, so replay never
+  contains stale `priv_feature` values. The task's fixed object point template is stored once
+  in the actor; `object_trans` is recomputed from each replayed `object_` pose and is not stored
+  in every replay row.
+- On the skateboard task this gives a 1,580-dimensional replay row: the actor keeps PPO's full
+  command and policy inputs, while both its privileged encoder and the critic use the critic's
+  928-dimensional privileged selection. At the default length this is about 30.42 GiB in host RAM.
+  The algorithm defaults to `algo.buffer_max_length=10000000`, checks available RAM before
+  allocation, and asynchronously stages sampled minibatches through pinned memory to the GPU.
+- The recurrent adaptation module is not trained from random long-term replay entries.
+  It and `actor_adapt` train from each latest contiguous `algo.train_every` rollout, matching
+  the sequence treatment in `ppo_vel_train`.
+- `actor_adapt` uses the same `FlashSACActor` backbone, UnitLinear/UnitNorm parameter
+  constraints, and tanh-Gaussian action parameterization as the teacher. Its semantic input
+  remains the PPOVEL student input `[vel_command, policy, priv_pred]`. On the skateboard task
+  this is 525 dimensions: 20 velocity-command values, 249 policy values, and a 256-dimensional
+  latent. Both PPOVEL and FlashSACVEL use this same student input.
+- `actor_adapt` distills the teacher's final joint command with MSE. With residual actions both
+  teacher and student commands are `ref_joint_pos_ + residual_scale * tanh(mean)`.
+- W&B uses the same adaptation metric names as `ppo_vel_train`: `adapt/priv_loss` is the
+  privileged-feature prediction MSE and `adapt/adapt_loss` is the actor distillation MSE.
+- This is the teacher/pretraining phase. A later student FlashSAC phase can freeze the
+  perception/adaptation modules and store their latent output instead of depth images.
+
 Teacher policy with PPO on the FlashSAC observation
 
 `ppo_vel_flat_train` isolates the effect of the input: PPO with `ppo_vel`'s networks, sizes and hyperparameters, reading the single flat vector `flashsac_vel_flat_train` builds instead of `ppo_vel_train`'s grouped tensors and adaptation modules.
