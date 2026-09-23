@@ -9,7 +9,9 @@ exp_name: ${oc.select:task.name,test}-${oc.select:algo.name,none}
 
 app:
   headless: ${..headless}
-  enable_cameras: ${oc.select:..task.enable_cameras,${..eval_render}}
+  # Ray-cast depth sensors do not need RTX. Algorithms can opt out independently
+  # of task.enable_cameras, which still controls creation of the depth sensor.
+  enable_cameras: ${oc.select:..algo.enable_rtx,${oc.select:..task.enable_cameras,${..eval_render}}}
 
 total_frames: 1_600_000_000
 # total_frames: 500_000_000

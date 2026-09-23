@@ -76,6 +76,12 @@ def train_off_policy(cfg, env, policy, run, episode_stats, save, should_save):
         episode_stats.add(torch.stack(stats_buf, dim=1))
         env_frames += frames_per_batch
 
+        # A staged policy may replace its recurrent perception at an iteration boundary.
+        # Start new episodes so hidden states collected with the old model never enter replay.
+        if getattr(policy, "needs_env_reset", False):
+            carry = env.reset()
+            policy.needs_env_reset = False
+
         info = {}
         if i % log_interval == 0 and len(episode_stats):
             for k, v in sorted(episode_stats.pop().items(True, True)):
@@ -100,6 +106,11 @@ def train_off_policy(cfg, env, policy, run, episode_stats, save, should_save):
 def main(cfg: DictConfig):
     OmegaConf.resolve(cfg)
     OmegaConf.set_struct(cfg, False)
+    if cfg.eval_render:
+        cfg.app.enable_cameras = True
+    if cfg.task.get("enable_cameras", False) and not cfg.app.enable_cameras:
+        print("[Info]: RTX rendering disabled; task depth sensors remain enabled "
+              "and use CUDA ray casting.")
     if cfg.algo.get("num_envs", None) is not None:
         # off-policy algos fix their own number of parallel envs
         cfg.task.num_envs = cfg.algo.num_envs
@@ -281,4 +292,3 @@ def main(cfg: DictConfig):
 
 if __name__ == "__main__":
     main()
-

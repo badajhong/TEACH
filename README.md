@@ -157,8 +157,77 @@ Use `algo.buffer_device_type=cuda` to keep it on the GPU instead.
   teacher and student commands are `ref_joint_pos_ + residual_scale * tanh(mean)`.
 - W&B uses the same adaptation metric names as `ppo_vel_train`: `adapt/priv_loss` is the
   privileged-feature prediction MSE and `adapt/adapt_loss` is the actor distillation MSE.
-- This is the teacher/pretraining phase. A later student FlashSAC phase can freeze the
-  perception/adaptation modules and store their latent output instead of depth images.
+- Continue with `flashsac_vel_finetune` below to train depth perception and then freeze it
+  for student SAC training.
+
+Two-stage FlashSAC student finetuning
+
+```bash
+python scripts/train.py \
+  algo=flashsac_vel_finetune \
+  task=G1/vaic/skateboard_general_tracking_stu \
+  checkpoint_path=/home/hcc/research/VAIC/outputs/2026-09-23/03-53-05-G1SkateboardGeneralTracking-flashsac_vel/wandb/latest-run/files/checkpoint_3000.pt
+```
+
+Defaults: 512 camera environments, `vecnorm=null`, 32 steps per iteration, CPU replay.
+The student task enables cameras and retains its configured depth noise/delay. Teacher
+checkpoints must contain the FlashSAC `actor_adapt` (`actor_adapt_arch=flashsac_v1`).
+
+Headless finetuning defaults to `algo.enable_rtx=false`: depth images are computed
+by the CUDA ray-cast sensor, so the RTX renderer is unnecessary. Keep
+`task.enable_cameras=true` to retain depth observations. On the 512-env skateboard
+task, disabling RTX reduced process RAM after environment/model initialization
+from about 26.8 GiB to 8.0 GiB. Models and perception still run on the GPU. RGB
+evaluation (`eval_render=true`) automatically enables RTX; it can also be enabled
+explicitly with `app.enable_cameras=true` or `algo.enable_rtx=true`.
+
+Stage 1 action noise is controlled by `algo.perception_rollout_noise_scale=1.1`:
+`u = tanh(teacher_mean + teacher_std * noise * scale)`. Set it to `0.5` for half
+the pre-tanh noise amplitude or `0.0` for deterministic teacher actions. This only
+affects Stage 1 rollouts; Stage 2 keeps its normal FlashSAC sampling. The teacher's
+predicted std comes from the checkpoint, not directly from `temp_target_sigma`.
+
+1. For `algo.perception_warmup_iters` **new** iterations (current default 100; set
+   `algo.perception_warmup_iters=3000` for the full perception warmup), the frozen teacher rolls out
+   with its normal FlashSAC exploration noise, including before any replay exists. Depth
+   CNN/GRU, object estimator and adaptation GRU train from short contiguous rollouts using
+   object MSE and privileged-latent MSE against the frozen teacher encoder. `actor_adapt`
+   trains with action MSE using detached **predicted** latents from EMA perception and the
+   teacher's deterministic action target. Teacher actor/encoder, critic/target critic and
+   temperature stay fixed. No long-term replay is allocated in this stage.
+2. The depth/object/adaptation models and their EMA copies freeze. Environments and hidden
+   states reset at the boundary. The distilled `actor_adapt` becomes the SAC actor; teacher
+   critic/target critic, temperature and reward-normalization statistics are retained.
+   Fresh RL optimizers/schedules start; the warm-start actor fills an empty replay until
+   `buffer_min_length=100000`, then SAC updates begin. No uniform random warmup is used.
+
+On this skateboard task the actor input is 525 dimensions (`vel_command` 20 + full `policy`
+249 + frozen latent 256). The replay observation is **1856** dimensions: existing teacher
+fields (full command 356, full policy 249, selected priv 928, object 22, action DR 2, reference
+joints 23) plus velocity command 20 and frozen latent 256. The critic still selects its
+original **1187** dimensions. Replay stores neither depth nor recurrent hidden states;
+next/terminal latents are computed with frozen perception before episode reset. Ten million
+float16 observation rows plus transition metadata take about **35.6 GiB** of host RAM.
+The default `algo.buffer_max_length=10000000` retains all 1856 observation dimensions;
+only sampled batches are copied to the GPU for SAC updates. The RAM availability
+check remains enabled. Terminate failed or suspended simulator runs before starting
+another run, because they retain their scene memory even without a replay buffer.
+
+Actions preserve the checkpoint's convention: by default
+`ref_joint_pos_ + residual_scale * tanh(z)`. Thus this student still requires reference joint
+positions for the final action even though they are outside the 525-dimensional actor input.
+Mean-action MSE does not supervise the stochastic std head; SAC trains it in Stage 2.
+
+W&B: `finetune/stage`, `finetune/warmup_iters_completed`, `finetune/iters_completed`,
+`adapt/priv_loss`, `adapt/object_loss`, `adapt/adapt_loss`, `adapt/teacher_student_action_rmse`,
+latent/depth feature norms, and the existing FlashSAC actor/critic/temperature metrics.
+Evaluation uses the student path (EMA perception + actor_adapt), including Stage 1 checkpoints.
+
+Finetune checkpoints preserve the phase, counters, depth models, EMA and optimizer states.
+Resume with the same algorithm and `perception_warmup_iters`; Stage 2 resumes with frozen
+perception and refills replay (replay and simulator hidden states are not checkpointed).
+`total_frames` is the frame budget for the current invocation, including any remaining warmup.
+Set `algo.perception_warmup_iters=2` and smaller replay/batch/env counts for a short smoke test.
 
 Teacher policy with PPO on the FlashSAC observation
 

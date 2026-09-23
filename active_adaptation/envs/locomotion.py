@@ -306,7 +306,8 @@ class SimpleEnv(_Env):
                 # for _ in range(4):
                 #     self.sim.render()
             except ModuleNotFoundError as e:
-                print("Set app.enable_cameras=true to use cameras.")
+                print("[Info]: RGB rendering is disabled. Ray-cast depth sensors remain available; "
+                      "set app.enable_cameras=true only if RTX rendering is needed.")
             
             try:
                 from active_adaptation.utils.debug import DebugDraw
@@ -397,5 +398,4 @@ class SimpleEnv(_Env):
                     size=1.0,
                     color=(1.0, 0.0, 0.0, 0.5)  # red with transparency
                 )
-
 
