@@ -181,10 +181,12 @@ from about 26.8 GiB to 8.0 GiB. Models and perception still run on the GPU. RGB
 evaluation (`eval_render=true`) automatically enables RTX; it can also be enabled
 explicitly with `app.enable_cameras=true` or `algo.enable_rtx=true`.
 
-Stage 1 action noise is controlled by `algo.perception_rollout_noise_scale=1.1`:
+Stage 1 action noise is controlled by `algo.teacher_perception_rollout_noise_scale=1.2`:
 `u = tanh(teacher_mean + teacher_std * noise * scale)`. Set it to `0.5` for half
-the pre-tanh noise amplitude or `0.0` for deterministic teacher actions. This only
-affects Stage 1 rollouts; Stage 2 keeps its normal FlashSAC sampling. The teacher's
+the pre-tanh noise amplitude or `0.0` for deterministic teacher actions. Repeated
+`perception_only` warmup sets roll out the frozen student with
+`algo.student_perception_rollout_noise_scale=1.2` in the same formula. Stage 2 keeps
+its normal FlashSAC sampling (scale 1.0). The teacher's
 predicted std comes from the checkpoint, not directly from `temp_target_sigma`.
 
 1. For `algo.perception_warmup_iters` **new** iterations (current default 100; set

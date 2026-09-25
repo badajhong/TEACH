@@ -1,4 +1,4 @@
-"""Teacher rollout distillation, followed by SAC with frozen recurrent perception.
+"""Repeat original teacher-rollout warmup and SAC with frozen perception.
 
 Only the short Stage 1 rollout contains depth/hidden states. Stage 2 replay stores the
 teacher replay fields followed by velocity commands and the frozen student latent.
@@ -39,10 +39,19 @@ class FlashSACVelFinetuneConfig(FlashSACVelConfig):
     # train.py enables rendering again for eval_render=true.
     enable_rtx: bool = False
     updates_per_interaction_step: float = 8.0
-    perception_warmup_iters: int = 1000
-    perception_rollout_noise_scale: float = 1.2
+    perception_warmup_iters: int = 500
+    # Repeat the same warmup after each SAC phase. Zero keeps one-shot warmup.
+    rl_phase_iters: int = 1000
+    # Total Stage 1 warmups (sets). After the last set, SAC runs to the end. 0 = unlimited.
+    num_warmup_cycles: int = 5
+    # Warmup sets after the first: "perception_only" rolls out the frozen student SAC actor
+    # (temperature 1.0) and trains perception only; "original" repeats the teacher warmup.
+    repeat_warmup_mode: str = "perception_only"
+    # Stage 1 rollout noise: u = tanh(mean + std * noise * scale). Stage 2 SAC always uses 1.0.
+    teacher_perception_rollout_noise_scale: float = 1.6  # first set (and "original" repeats)
+    student_perception_rollout_noise_scale: float = 1.0  # "perception_only" repeat sets
     adapt_epochs: int = 2
-    perception_ema_tau: float = 0.16
+    perception_ema_tau: float = 0.08
     in_keys: List[str] = (*FlashSACVelConfig.in_keys, DEPTH_KEY)
     buffer_max_length: int = 10_000_000
     buffer_device_type: str = "cpu"
@@ -73,7 +82,8 @@ class FinetuneRollout(TensorDictModuleBase):
         if ACTION_DR_KEY in p.replay_keys:
             td[ACTION_DR_KEY] = p.action_dr()
         p._perceive(td, ema=True)
-        if self.train_mode and p.stage == 1:
+        teacher_rollout = self.train_mode and p.stage == 1 and not p.perception_only_warmup
+        if teacher_rollout:
             network, observation = p._actor, p.replay_obs(td)
         else:
             network = p._student if p._student is not None else p._student_rollout
@@ -83,7 +93,7 @@ class FinetuneRollout(TensorDictModuleBase):
             p._cached_noise, u, p._cur_noise_repeat_count, p._cur_noise_repeat_n = (
                 _sample_flashsac_actions(
                     actor=network, noise=p._cached_noise, observations=observation,
-                    temperature=(p.cfg.perception_rollout_noise_scale if p.stage == 1 else 1.0),
+                    temperature=p._rollout_noise_scale(teacher_rollout),
                     cur_count=p._cur_noise_repeat_count,
                     cur_n=p._cur_noise_repeat_n, zeta_cdf=p._zeta_cdf,
                 )
@@ -100,8 +110,13 @@ class FlashSACVelFinetune(FlashSACVel):
     def __init__(self, cfg, observation_spec, action_spec, reward_spec, device, env):
         if cfg.perception_warmup_iters < 0 or cfg.adapt_epochs < 1:
             raise ValueError("perception_warmup_iters must be >= 0 and adapt_epochs >= 1")
-        if not 0 <= cfg.perception_rollout_noise_scale < float("inf"):
-            raise ValueError("perception_rollout_noise_scale must be finite and >= 0")
+        if cfg.rl_phase_iters < 0 or cfg.num_warmup_cycles < 0:
+            raise ValueError("rl_phase_iters and num_warmup_cycles must be >= 0")
+        if cfg.repeat_warmup_mode not in ("perception_only", "original"):
+            raise ValueError("repeat_warmup_mode must be 'perception_only' or 'original'")
+        for name in ("teacher_perception_rollout_noise_scale", "student_perception_rollout_noise_scale"):
+            if not 0 <= getattr(cfg, name) < float("inf"):
+                raise ValueError(f"{name} must be finite and >= 0")
         if not 0 < cfg.perception_ema_tau <= 1:
             raise ValueError("perception_ema_tau must be in (0, 1]")
         if cfg.adapt_module != "gru" or not cfg.use_object_adapt:
@@ -115,6 +130,8 @@ class FlashSACVelFinetune(FlashSACVel):
             raise ValueError("num_envs must be divisible by adapt_num_minibatches")
         self.stage = 1
         self.warmup_iters_completed = 0
+        self.rl_phase_iters_completed = 0
+        self.cycles_completed = 0
         self.finetune_iters_completed = 0
         self._rl_steps_in_iteration = 0
         self._checkpoint_loaded = False
@@ -134,7 +151,22 @@ class FlashSACVelFinetune(FlashSACVel):
             *range(self.replay_obs_dim + self.vel_command_dim, self.student_replay_dim),
         ], device=self.device)
         print(f"[FlashSAC finetune] warmup {cfg.perception_warmup_iters} iterations; "
+              f"SAC phase {cfg.rl_phase_iters} iterations (0 = no repeated warmup); "
+              f"{cfg.num_warmup_cycles or 'unlimited'} warmup sets "
+              f"(repeat mode {cfg.repeat_warmup_mode}); "
               f"student replay {self.student_replay_dim}, critic input {self.obs_dim} dims.")
+
+    @property
+    def perception_only_warmup(self):
+        return (self.stage == 1 and self.cycles_completed > 0 and
+                self.cfg.repeat_warmup_mode == "perception_only")
+
+    def _rollout_noise_scale(self, teacher_rollout):
+        if teacher_rollout:
+            return self.cfg.teacher_perception_rollout_noise_scale
+        if self.perception_only_warmup:
+            return self.cfg.student_perception_rollout_noise_scale
+        return 1.0
 
     def _build_adaptation(self, observation_spec):
         super()._build_adaptation(observation_spec)
@@ -252,6 +284,7 @@ class FlashSACVelFinetune(FlashSACVel):
         self._rl_steps_in_iteration += 1
         if self._rl_steps_in_iteration == self.cfg.train_every:
             self.finetune_iters_completed += 1
+            self.rl_phase_iters_completed += 1
             self._rl_steps_in_iteration = 0
 
     def _student_replay_obs(self, td, latent):
@@ -290,6 +323,13 @@ class FlashSACVelFinetune(FlashSACVel):
                     self._start_rl()
             return
         FlashSACVelFlat.update(self)
+        if (self.cfg.perception_warmup_iters > 0 and self.cfg.rl_phase_iters > 0 and
+                self._rl_steps_in_iteration == 0 and
+                self.rl_phase_iters_completed >= self.cfg.rl_phase_iters and
+                (self.cfg.num_warmup_cycles == 0 or
+                 self.cycles_completed + 1 < self.cfg.num_warmup_cycles)):
+            self.cycles_completed += 1
+            self._start_warmup()
 
     @set_recurrent_mode(True)
     def _train_warmup(self, rollout):
@@ -318,6 +358,22 @@ class FlashSACVelFinetune(FlashSACVel):
                 with torch.no_grad():
                     self._perceive(batch, ema=True)
                 inputs = self._actor_adapt_input(batch).flatten(0, 1).detach()
+                info = {
+                    "adapt/priv_loss": priv_loss.detach(), "adapt/object_loss": object_loss.detach(),
+                    "adapt/priv_feature_norm": batch[PRIV_FEATURE_KEY].norm(dim=-1).mean().detach(),
+                    "adapt/priv_pred_norm": priv_pred_norm,
+                    "adapt/depth_feature_norm": depth_feature_norm,
+                }
+                if self.perception_only_warmup:
+                    # The SAC actor stays frozen; only monitor its distance from the teacher.
+                    with torch.no_grad():
+                        student_mean, _ = self.actor_adapt.get_mean_and_std(inputs, training=False)
+                        student_action = self._joint_action(
+                            torch.tanh(student_mean).reshape(*batch.batch_size, self.action_dim), batch)
+                        mse = ((student_action - batch["_teacher_action"]).square() * valid).mean()
+                    info["adapt/teacher_student_action_rmse"] = mse.sqrt()
+                    infos.append(info)
+                    continue
                 student_mean, _ = self.actor_adapt.get_mean_and_std(inputs, training=True)
                 student_action = self._joint_action(
                     torch.tanh(student_mean).reshape(*batch.batch_size, self.action_dim), batch)
@@ -327,14 +383,9 @@ class FlashSACVelFinetune(FlashSACVel):
                 nn.utils.clip_grad_norm_(self.actor_adapt.parameters(), self.cfg.max_grad_norm)
                 self.opt_adapt_actor.step()
                 self._normalize_actor_adapt_parameters()
-                infos.append({
-                    "adapt/priv_loss": priv_loss.detach(), "adapt/object_loss": object_loss.detach(),
-                    "adapt/adapt_loss": adapt_loss.detach(),
-                    "adapt/teacher_student_action_rmse": adapt_loss.detach().sqrt(),
-                    "adapt/priv_feature_norm": batch[PRIV_FEATURE_KEY].norm(dim=-1).mean().detach(),
-                    "adapt/priv_pred_norm": priv_pred_norm,
-                    "adapt/depth_feature_norm": depth_feature_norm,
-                })
+                info["adapt/adapt_loss"] = adapt_loss.detach()
+                info["adapt/teacher_student_action_rmse"] = adapt_loss.detach().sqrt()
+                infos.append(info)
         with torch.no_grad():
             for source, target in self._perception_pairs():
                 for src, dst in zip(source.parameters(), target.parameters()):
@@ -345,14 +396,32 @@ class FlashSACVelFinetune(FlashSACVel):
         for pair in self._perception_pairs():
             for model in pair:
                 model.requires_grad_(False).eval()
+        self.actor_adapt.requires_grad_(True)
         self.critic.requires_grad_(True)
         self.temperature.requires_grad_(True)
+        self.stage = 2
+        self.rl_phase_iters_completed = 0
+        self._reset_phase_rollout()
+        print("[FlashSAC finetune] Stage 2: perception and EMA frozen; student SAC enabled. "
+              "Resetting environments/hidden states; replay starts empty.")
+        if self._student is not None:
+            # Continue SAC optimizer/scheduler state after repeated supervised warmup.
+            return
         # Existing critic/temperature optimizers are fresh when loading a teacher. They
         # have not stepped during warmup. Student SAC gets a separate fresh optimizer.
         optimizer = optim.Adam(self.actor_adapt.parameters(), lr=self.cfg.learning_rate_peak,
                                fused=self.device.type == "cuda")
+        horizon = self.cfg.num_env_steps // self.num_envs
         warmup_steps = self.cfg.perception_warmup_iters * self.cfg.train_every
-        steps = max(1, self.cfg.num_env_steps // self.num_envs - warmup_steps)
+        rl_steps = self.cfg.rl_phase_iters * self.cfg.train_every
+        # Count the RL env steps left after every warmup set that fits in the horizon.
+        warmups, elapsed, steps = 1, warmup_steps, 0
+        while (warmup_steps and rl_steps and elapsed + rl_steps < horizon and
+               (self.cfg.num_warmup_cycles == 0 or warmups < self.cfg.num_warmup_cycles)):
+            warmups += 1
+            steps += rl_steps
+            elapsed += rl_steps + warmup_steps
+        steps = max(1, steps + max(0, horizon - elapsed))
         updates = schedule_updates or max(1, int(steps * self.cfg.updates_per_interaction_step))
         self._rl_schedule_updates = updates
         schedule = warmup_cosine_decay_scheduler(
@@ -361,7 +430,7 @@ class FlashSACVelFinetune(FlashSACVel):
             warmup_steps=int(self.cfg.learning_rate_warmup_rate * updates),
             decay_steps=max(1, int(self.cfg.learning_rate_decay_rate * updates)),
         )
-        # Restart all RL schedules at the stage boundary, using the remaining RL horizon.
+        # Initialize schedules once; later cycles retain their SAC update progress.
         for network in (self._critic, self._temperature):
             network.scheduler = torch.optim.lr_scheduler.LambdaLR(
                 network.optimizer, lr_lambda=lambda step: schedule(step) / self.cfg.learning_rate_peak)
@@ -376,17 +445,39 @@ class FlashSACVelFinetune(FlashSACVel):
             self._student.network.get_mean_and_std = torch.compile(
                 self._student.network.get_mean_and_std, mode=self.flash_cfg.compile_mode)
         self._student.normalize_parameters()
-        self.stage = 2
-        self.buffer = None
         self._update_step = 0
+
+    def _reset_phase_rollout(self):
+        self.buffer = None
+        self._adapt_steps.clear()
+        self._pending_adapt = None
+        self._rl_steps_in_iteration = 0
         self._update_counter = 0.
         self._cur_noise_repeat_count.zero_()
         self._cur_noise_repeat_n.fill_(1)
         if self.reward_normalizer is not None:
             self.reward_normalizer.G_r.zero_()
         self.needs_env_reset = True
-        print("[FlashSAC finetune] Stage 2: perception and EMA frozen; student SAC enabled. "
-              "Resetting environments/hidden states; replay starts empty.")
+
+    def _start_warmup(self):
+        self.stage = 1
+        self.warmup_iters_completed = 0
+        self._reset_phase_rollout()
+        for online, ema in self._perception_pairs():
+            online.requires_grad_(True).train()
+            ema.requires_grad_(False).eval()
+        # perception_only_warmup reads self.stage, which is already 1 here.
+        self.actor_adapt.requires_grad_(not self.perception_only_warmup).train()
+        for model in (self.critic, self.temperature):
+            model.requires_grad_(False)
+            model.zero_grad(set_to_none=True)
+        # Same as the original warmup: supervised optimizers start without Adam moments.
+        for optimizer in (self.opt_adapt, self.opt_adapt_actor):
+            optimizer.state.clear()
+        kind = ("frozen-student-rollout perception-only" if self.perception_only_warmup
+                else "original teacher-rollout")
+        print(f"[FlashSAC finetune] Stage 1: restarting {kind} warmup "
+              f"after SAC cycle {self.cycles_completed}; replay released.")
 
     def _update_once(self):
         batch = self.buffer.sample()
@@ -410,20 +501,28 @@ class FlashSACVelFinetune(FlashSACVel):
         info = super().pop_info()
         info.update({"finetune/stage": self.stage,
                      "finetune/warmup_iters_completed": self.warmup_iters_completed,
+                     "finetune/rl_phase_iters_completed": self.rl_phase_iters_completed,
+                     "finetune/cycles_completed": self.cycles_completed,
                      "finetune/iters_completed": self.finetune_iters_completed})
-        info["actor/lr"] = (self._student.optimizer if self.stage == 2 else
-                            self.opt_adapt_actor).param_groups[0]["lr"]
+        info["actor/lr"] = (self.opt_adapt_actor if self.stage == 1 and not self.perception_only_warmup
+                            else self._student.optimizer).param_groups[0]["lr"]
         return info
 
     def state_dict(self):
         state = super().state_dict()
-        state["finetune_version"] = 1
+        state["finetune_version"] = 5
+        state["finetune_method"] = "repeated_original_warmup_v1"
         state["finetune_stage"] = self.stage
         state["warmup_iters_completed"] = self.warmup_iters_completed
         state["finetune_iters_completed"] = self.finetune_iters_completed
         state["student_replay_dim"] = self.student_replay_dim
         state["student_replay_index"] = self._student_replay_index.cpu()
         state["perception_warmup_iters"] = self.cfg.perception_warmup_iters
+        state["rl_phase_iters"] = self.cfg.rl_phase_iters
+        state["num_warmup_cycles"] = self.cfg.num_warmup_cycles
+        state["repeat_warmup_mode"] = self.cfg.repeat_warmup_mode
+        state["rl_phase_iters_completed"] = self.rl_phase_iters_completed
+        state["cycles_completed"] = self.cycles_completed
         for name in ("temporal_depth_gru", "temporal_depth_gru_ema"):
             state[name] = getattr(self, name).state_dict()
         if self._student is not None:
@@ -433,12 +532,21 @@ class FlashSACVelFinetune(FlashSACVel):
         return state
 
     def load_state_dict(self, state_dict, strict=True):
-        resume = state_dict.get("finetune_version") == 1
+        resume = state_dict.get("finetune_version") in (1, 5)
         if "finetune_version" in state_dict and not resume:
             raise ValueError("Unsupported finetune checkpoint version")
         if state_dict.get("actor_adapt_arch") != "flashsac_v1":
             raise ValueError("Finetune requires a teacher checkpoint with FlashSAC actor_adapt")
         if resume:
+            if state_dict.get("finetune_version") == 5:
+                if state_dict.get("finetune_method") != "repeated_original_warmup_v1":
+                    raise ValueError("Unsupported finetune method")
+                if state_dict["rl_phase_iters"] != self.cfg.rl_phase_iters:
+                    raise ValueError("Use the checkpoint's rl_phase_iters when resuming")
+                if state_dict.get("num_warmup_cycles", 0) != self.cfg.num_warmup_cycles:
+                    raise ValueError("Use the checkpoint's num_warmup_cycles when resuming")
+                if state_dict.get("repeat_warmup_mode", "original") != self.cfg.repeat_warmup_mode:
+                    raise ValueError("Use the checkpoint's repeat_warmup_mode when resuming")
             if state_dict["finetune_stage"] not in (1, 2):
                 raise ValueError("Invalid finetune stage in checkpoint")
             if (state_dict["student_replay_dim"] != self.student_replay_dim or
@@ -459,9 +567,10 @@ class FlashSACVelFinetune(FlashSACVel):
         if resume:
             for name in ("temporal_depth_gru", "temporal_depth_gru_ema"):
                 getattr(self, name).load_state_dict(state_dict[name], strict=strict)
-            self.warmup_iters_completed = state_dict["warmup_iters_completed"]
             self.finetune_iters_completed = state_dict["finetune_iters_completed"]
-            if state_dict["finetune_stage"] == 2:
+            self.cycles_completed = state_dict.get("cycles_completed", 0)
+            # A repeated warmup also retains the preceding SAC optimizer/scheduler.
+            if "student_optimizer" in state_dict:
                 self._start_rl(schedule_updates=state_dict.get("rl_schedule_updates"))
                 self._student.optimizer.load_state_dict(state_dict["student_optimizer"])
                 self._student.scheduler.load_state_dict(state_dict["student_scheduler"])
@@ -469,6 +578,13 @@ class FlashSACVelFinetune(FlashSACVel):
                     network.optimizer.load_state_dict(state_dict[f"{name}_optimizer"])
                     network.scheduler.load_state_dict(state_dict[f"{name}_scheduler"])
                 self._update_step = state_dict["update_step"]
+                if state_dict["finetune_stage"] == 1:
+                    self._start_warmup()
+                    for name in ("opt_adapt", "opt_adapt_actor"):
+                        if name in state_dict:
+                            getattr(self, name).load_state_dict(state_dict[name])
+            self.warmup_iters_completed = state_dict["warmup_iters_completed"]
+            self.rl_phase_iters_completed = state_dict.get("rl_phase_iters_completed", 0)
         elif self.cfg.perception_warmup_iters == 0:
             self._start_rl()
         if self.reward_normalizer is not None:
