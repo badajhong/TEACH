@@ -1,5 +1,17 @@
-"""Repeat original teacher-rollout warmup and SAC with frozen perception.
+"""CoSIL on top of the FlashSAC student finetune (copy of flashsac_vel_finetune's flow).
 
+CoSIL (Nguyen et al., "Leveraging Fully Observable Policies for Learning under Partial
+Observability", CoRL 2022) regularizes the partially observable student SAC actor pi(h) toward
+the frozen fully observable teacher mu(s) (the state expert) with an adaptive coefficient beta:
+
+    D(s, h) = sum_j (tanh m_T,j(s) - tanh m_theta,j(h))^2        teacher vs student mean action
+    critic:  z' = R^(n) + gamma^n (1 - d) (z - penalty(s', h'))
+    actor:   L_pi   = E[beta D(s, h) - min_i Q_i(s, a~)] (+ alpha log pi(a~|h) with entropy)
+    beta:    L_beta = beta (target_divergence - E[D])
+    "cosil":         penalty = beta D                      (paper: D replaces the entropy term)
+    "cosil_entropy": penalty = alpha log pi(a'|h') + beta D  (FlashSAC entropy kept, D added)
+
+Everything else (warmup cycles, perception training, replay, rollout) follows flashsac_vel_finetune.
 Only the short Stage 1 rollout contains depth/hidden states. Stage 2 replay stores the
 teacher replay fields followed by velocity commands and the frozen student latent.
 Actions keep the teacher's residual/absolute convention, including ref_joint_pos_.
@@ -20,7 +32,12 @@ from torchrl.envs.transforms import TensorDictPrimer
 from .common import ACTION_KEY, OBS_KEY, CatTensors, make_batch, make_conv
 from .flashsac_vel import FlashSACVel, FlashSACVelConfig
 from .flashsac_vel_flat import ACTION_DR_KEY, U_KEY, FlashSACVelFlat, NStepTrajectoryReplay
-from .flashsac_upstream.agent import _sample_flashsac_actions, _update_networks
+from .flashsac_upstream.agent import _sample_flashsac_actions
+from .flashsac_upstream.distribution import safe_tanh_log_det_jacobian
+from .flashsac_upstream.network import FlashSACTemperature
+from .flashsac_upstream.update import (
+    _compute_categorical_td_target, _select_min_q_log_probs, update_target_network, update_temperature,
+)
 from .flashsac_upstream.scheduler import warmup_cosine_decay_scheduler
 from .flashsac_upstream.utils_network import Network
 from .ppo_vel import (
@@ -31,9 +48,9 @@ from ..modules.rnn import set_recurrent_mode
 
 
 @dataclass
-class FlashSACVelFinetuneConfig(FlashSACVelConfig):
-    _target_: str = "active_adaptation.learning.ppo.flashsac_vel_finetune.FlashSACVelFinetune"
-    name: str = "flashsac_vel_finetune"
+class CoSILFlashSACVelFinetuneConfig(FlashSACVelConfig):
+    _target_: str = "active_adaptation.learning.ppo.cosil_flashsac_vel_finetune.CoSILFlashSACVelFinetune"
+    name: str = "cosil_flashsac_vel_finetune"
     num_envs: int = 4096
     # Depth comes from CUDA ray casting; headless training needs no RTX renderer.
     # train.py enables rendering again for eval_render=true.
@@ -65,14 +82,21 @@ class FlashSACVelFinetuneConfig(FlashSACVelConfig):
     # ~one episode per env (4096 envs x ~635 steps), so updates never see only reset states.
     buffer_min_length: int = 2_600_000
     buffer_device_type: str = "cpu"
+    # CoSIL (see module docstring). "cosil": D replaces the entropy term; "cosil_entropy":
+    # FlashSAC's entropy term is kept and D is added. D is summed over the action dims in the
+    # normalized action space u = tanh(.), so it lies in [0, 4 * action_dim].
+    cosil_mode: str = "cosil_entropy"
+    # D-bar: beta grows while E[D] > target_divergence (imitate more), shrinks below it (more RL).
+    target_divergence: float = 0.5
+    beta_init: float = 0.1
 
 
 ConfigStore.instance().store(
-    "flashsac_vel_finetune", node=FlashSACVelFinetuneConfig, group="algo"
+    "cosil_flashsac_vel_finetune", node=CoSILFlashSACVelFinetuneConfig, group="algo"
 )
 
 
-class FinetuneRollout(TensorDictModuleBase):
+class CoSILFinetuneRollout(TensorDictModuleBase):
     def __init__(self, policy, mode):
         super().__init__()
         object.__setattr__(self, "policy", policy)
@@ -88,7 +112,7 @@ class FinetuneRollout(TensorDictModuleBase):
     def forward(self, td):
         p = self.policy
         if not p._checkpoint_loaded:
-            raise RuntimeError("flashsac_vel_finetune requires checkpoint_path to a teacher or finetune checkpoint")
+            raise RuntimeError("cosil_flashsac_vel_finetune requires checkpoint_path to a teacher or finetune checkpoint")
         if ACTION_DR_KEY in p.replay_keys:
             td[ACTION_DR_KEY] = p.action_dr()
         p._perceive(td, ema=True)
@@ -116,7 +140,7 @@ class FinetuneRollout(TensorDictModuleBase):
         return td
 
 
-class FlashSACVelFinetune(FlashSACVel):
+class CoSILFlashSACVelFinetune(FlashSACVel):
     def __init__(self, cfg, observation_spec, action_spec, reward_spec, device, env):
         if cfg.perception_warmup_iters < 0 or cfg.adapt_epochs < 1:
             raise ValueError("perception_warmup_iters must be >= 0 and adapt_epochs >= 1")
@@ -126,6 +150,10 @@ class FlashSACVelFinetune(FlashSACVel):
         if cfg.num_cycles > 0 and min(schedule) < 1:
             raise ValueError("repeated cycles need rl_phase_iters, cycle_warmup_iters and "
                              "cycle_rl_phase_iters >= 1")
+        if cfg.cosil_mode not in ("cosil", "cosil_entropy"):
+            raise ValueError("cosil_mode must be 'cosil' or 'cosil_entropy'")
+        if cfg.target_divergence < 0 or not cfg.beta_init > 0:
+            raise ValueError("target_divergence must be >= 0 and beta_init > 0")
         if cfg.cycle_warmup_mode not in ("perception_only", "original"):
             raise ValueError("cycle_warmup_mode must be 'perception_only' or 'original'")
         for name in ("teacher_perception_rollout_noise_scale", "student_perception_rollout_noise_scale"):
@@ -134,7 +162,7 @@ class FlashSACVelFinetune(FlashSACVel):
         if not 0 < cfg.perception_ema_tau <= 1:
             raise ValueError("perception_ema_tau must be in (0, 1]")
         if cfg.adapt_module != "gru" or not cfg.use_object_adapt:
-            raise ValueError("flashsac_vel_finetune requires GRU and object adaptation")
+            raise ValueError("cosil_flashsac_vel_finetune requires GRU and object adaptation")
         if not cfg.enable_residual_distillation:
             raise ValueError("Stage 1 requires enable_residual_distillation=true")
         if observation_spec.get(DEPTH_KEY, None) is None:
@@ -151,6 +179,7 @@ class FlashSACVelFinetune(FlashSACVel):
         self._checkpoint_loaded = False
         self.needs_env_reset = False
         self._student = None
+        self._beta = None
         self._student_rollout = Network(self.actor_adapt)
         self._adapt_buffer, self._adapt_t = None, 0
         self.actor.requires_grad_(False).eval()
@@ -170,6 +199,8 @@ class FlashSACVelFinetune(FlashSACVel):
               f"{cfg.cycle_warmup_iters} + SAC {cfg.cycle_rl_phase_iters}) "
               f"(cycle mode {cfg.cycle_warmup_mode}); "
               f"student replay {self.student_replay_dim}, critic input {self.obs_dim} dims.")
+        print(f"[CoSIL] mode {cfg.cosil_mode}, target_divergence {cfg.target_divergence}, "
+              f"beta_init {cfg.beta_init}.")
 
     @property
     def perception_only_warmup(self):
@@ -236,7 +267,7 @@ class FlashSACVelFinetune(FlashSACVel):
         }, reset_key="done")
 
     def get_rollout_policy(self, mode="train"):
-        return FinetuneRollout(self, mode)
+        return CoSILFinetuneRollout(self, mode)
 
     def _perceive(self, td, ema):
         depth, obj, adapt = (
@@ -475,6 +506,12 @@ class FlashSACVelFinetune(FlashSACVel):
             self._student.network.get_mean_and_std = torch.compile(
                 self._student.network.get_mean_and_std, mode=self.flash_cfg.compile_mode)
         self._student.normalize_parameters()
+        # CoSIL coefficient, built like FlashSAC's temperature and stepped with the actor.
+        beta_net = FlashSACTemperature(self.cfg.beta_init).to(self.device)
+        beta_optimizer = optim.Adam(beta_net.parameters(), lr=self.cfg.learning_rate_peak,
+                                    fused=self.device.type == "cuda")
+        self._beta = Network(beta_net, beta_optimizer, torch.optim.lr_scheduler.LambdaLR(
+            beta_optimizer, lr_lambda=lr_lambda(actor_updates)))
         self._update_step = 0
 
     def _reset_phase_rollout(self):
@@ -514,20 +551,113 @@ class FlashSACVelFinetune(FlashSACVel):
 
     def _update_once(self):
         batch = self.buffer.sample()
-        for key, actor_key in (("observation", "actor_observation"),
-                               ("next_observation", "actor_next_observation")):
+        for key, actor_key, teacher_key in (
+                ("observation", "actor_observation", "teacher_observation"),
+                ("next_observation", "actor_next_observation", "teacher_next_observation")):
             obs = batch[key]
             batch[actor_key] = obs.index_select(-1, self._student_replay_index)
+            batch[teacher_key] = obs[..., :self.replay_obs_dim]  # the teacher's own input
             batch[key] = self.critic_obs(obs)
         if self.reward_normalizer is not None:
             batch["reward"] = self.reward_normalizer.normalize_rewards(batch["reward"])
-        info = _update_networks(
-            batch=batch, actor=self._student, critic=self._critic, target_critic=self._target_critic,
-            temperature=self._temperature, cfg=self.flash_cfg,
-            do_actor_update=self._update_step % self.flash_cfg.actor_update_period == 0,
-            device=self.device, grad_scaler=self._grad_scaler,
-        )
+        info = self._cosil_update_networks(
+            batch, do_actor_update=self._update_step % self.flash_cfg.actor_update_period == 0)
         self._update_step += 1
+        return info
+
+    def _sample_student(self, observations, training):
+        """FlashSAC's tanh-Gaussian policy sample, also returning the mean for D."""
+        mean, std = self._student.apply("get_mean_and_std", observations, training=training)
+        raw = mean + std * torch.randn_like(mean)
+        log_prob = torch.distributions.Normal(mean, std).log_prob(raw) - safe_tanh_log_det_jacobian(raw)
+        return torch.tanh(raw), log_prob.sum(-1), torch.tanh(mean)
+
+    def _optimizer_step(self, network, loss):
+        # Same step as flashsac_upstream.update (shared AMP grad scaler, LR schedule, weight norm).
+        network.optimizer.zero_grad(set_to_none=True)
+        if self.flash_cfg.use_amp:
+            self._grad_scaler.scale(loss).backward()
+            self._grad_scaler.step(network.optimizer)
+            self._grad_scaler.update()
+        else:
+            loss.backward()
+            network.optimizer.step()
+        if network.scheduler is not None:
+            network.scheduler.step()
+
+    def _cosil_update_networks(self, batch, do_actor_update):
+        """flashsac_upstream.agent._update_networks with the CoSIL actor, beta and critic target."""
+        cfg, device = self.flash_cfg, self.device
+        entropy_on = self.cfg.cosil_mode == "cosil_entropy"
+        student, critic, target_critic = self._student, self._critic, self._target_critic
+        with torch.no_grad():  # state expert mu(s), mu(s') from the frozen teacher
+            teacher_obs = torch.cat([batch["teacher_observation"], batch["teacher_next_observation"]])
+            teacher_mean, _ = self.actor.get_mean_and_std(teacher_obs, training=False)
+            mu, mu_next = torch.tanh(teacher_mean.float()).clone().chunk(2)
+        info = {}
+        if do_actor_update:
+            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=cfg.use_amp):
+                actor_obs_all = torch.cat([batch["actor_observation"], batch["actor_next_observation"]])
+                actions_all, log_probs_all, mean_actions_all = self._sample_student(actor_obs_all, True)
+                actions = actions_all.chunk(2)[0]
+                log_probs = log_probs_all.chunk(2)[0]
+                divergence = (mu - mean_actions_all.chunk(2)[0].float()).square().sum(-1)
+                # Disable critic gradients to prevent CUDA graph overwriting (as upstream).
+                critic.network.requires_grad_(False)
+                qs, _ = critic(observations=batch["observation"], actions=actions, training=False)
+                q = torch.minimum(qs[0], qs[1])
+                critic.network.requires_grad_(True)
+                beta = self._beta().detach()
+                actor_loss = beta * divergence - q
+                if entropy_on:
+                    actor_loss = actor_loss + self._temperature().detach() * log_probs
+                actor_loss = actor_loss.mean()
+                entropy = -log_probs.mean()
+                mean_action = actions.mean()
+            self._optimizer_step(student, actor_loss)
+            student.normalize_parameters()
+            info.update({"actor/loss": actor_loss.detach(), "actor/entropy": entropy.detach(),
+                         "actor/mean_action": mean_action.detach()})
+            # beta: grows while E[D] > target_divergence, shrinks below it.
+            divergence_mean = divergence.detach().float().mean()
+            beta_value = self._beta()
+            beta_loss = beta_value * (self.cfg.target_divergence - divergence_mean)
+            self._beta.optimizer.zero_grad(set_to_none=True)
+            beta_loss.backward()
+            self._beta.optimizer.step()
+            self._beta.scheduler.step()
+            info.update({"cosil/divergence": divergence_mean, "cosil/beta": beta_value.detach().squeeze(),
+                         "cosil/beta_loss": beta_loss.detach().squeeze()})
+            if entropy_on:
+                info.update(update_temperature(
+                    temperature=self._temperature, entropy=entropy.detach(),
+                    target_entropy=cfg.temp_target_entropy))
+
+        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=cfg.use_amp):
+            with torch.no_grad():
+                next_actions, next_log_probs, next_mean_actions = self._sample_student(
+                    batch["actor_next_observation"], False)
+                next_actions = next_actions.clone()
+                next_divergence = (mu_next - next_mean_actions.float()).square().sum(-1)
+                penalty = self._beta().detach().squeeze() * next_divergence
+                if entropy_on:
+                    penalty = penalty + self._temperature().detach().squeeze() * next_log_probs.clone().float()
+                obs_all = torch.cat([batch["observation"], batch["next_observation"]])
+                act_all = torch.cat([batch["action"], next_actions])
+                qs_all, q_infos_all = target_critic(observations=obs_all, actions=act_all, training=True)
+                next_qs = qs_all.chunk(2, dim=1)[1]
+                next_q_log_probs = _select_min_q_log_probs(next_qs, q_infos_all["log_prob"].chunk(2, dim=1)[1])
+                target_probs = _compute_categorical_td_target(
+                    target_log_probs=next_q_log_probs, reward=batch["reward"], done=batch["terminated"],
+                    actor_entropy=penalty, gamma=cfg.gamma ** cfg.n_step, num_bins=cfg.critic_num_bins,
+                    min_v=cfg.critic_min_v, max_v=cfg.critic_max_v)
+            _, pred_q_infos = critic(observations=obs_all, actions=act_all, training=True)
+            pred_log_probs = pred_q_infos["log_prob"].chunk(2, dim=1)[0]
+            critic_loss = -(target_probs.unsqueeze(0) * pred_log_probs).sum(dim=-1).mean()
+        self._optimizer_step(critic, critic_loss)
+        critic.normalize_parameters()
+        update_target_network(target_network=target_critic)
+        info.update({"critic/loss": critic_loss.detach(), "critic/max_penalty": penalty.max()})
         return info
 
     def pop_info(self):
@@ -539,6 +669,8 @@ class FlashSACVelFinetune(FlashSACVel):
                      "finetune/iters_completed": self.finetune_iters_completed})
         info["actor/lr"] = (self.opt_adapt_actor if self.stage == 1 and not self.perception_only_warmup
                             else self._student.optimizer).param_groups[0]["lr"]
+        if self._beta is not None:
+            info["cosil/beta_value"] = self._beta().item()
         return info
 
     def state_dict(self):
@@ -564,6 +696,10 @@ class FlashSACVelFinetune(FlashSACVel):
             state["rl_schedule_updates"] = self._rl_schedule_updates
             state["student_optimizer"] = self._student.optimizer.state_dict()
             state["student_scheduler"] = self._student.scheduler.state_dict()
+            state["cosil_beta"] = self._beta.network.state_dict()
+            state["cosil_beta_optimizer"] = self._beta.optimizer.state_dict()
+            state["cosil_beta_scheduler"] = self._beta.scheduler.state_dict()
+        state["cosil_mode"] = self.cfg.cosil_mode
         return state
 
     def load_state_dict(self, state_dict, strict=True):
@@ -606,6 +742,10 @@ class FlashSACVelFinetune(FlashSACVel):
                     network.optimizer.load_state_dict(state_dict[f"{name}_optimizer"])
                     network.scheduler.load_state_dict(state_dict[f"{name}_scheduler"])
                 self._update_step = state_dict["update_step"]
+                if "cosil_beta" in state_dict:  # a flashsac_vel_finetune checkpoint starts beta fresh
+                    self._beta.network.load_state_dict(state_dict["cosil_beta"])
+                    self._beta.optimizer.load_state_dict(state_dict["cosil_beta_optimizer"])
+                    self._beta.scheduler.load_state_dict(state_dict["cosil_beta_scheduler"])
                 if state_dict["finetune_stage"] == 1:
                     self._start_warmup()
                     for name in ("opt_adapt", "opt_adapt_actor"):

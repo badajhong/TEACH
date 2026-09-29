@@ -181,16 +181,15 @@ from about 26.8 GiB to 8.0 GiB. Models and perception still run on the GPU. RGB
 evaluation (`eval_render=true`) automatically enables RTX; it can also be enabled
 explicitly with `app.enable_cameras=true` or `algo.enable_rtx=true`.
 
-Stage 1 action noise is controlled by `algo.teacher_perception_rollout_noise_scale=1.2`:
+Stage 1 action noise is controlled by `algo.teacher_perception_rollout_noise_scale=1.6`:
 `u = tanh(teacher_mean + teacher_std * noise * scale)`. Set it to `0.5` for half
 the pre-tanh noise amplitude or `0.0` for deterministic teacher actions. Repeated
 `perception_only` warmup sets roll out the frozen student with
-`algo.student_perception_rollout_noise_scale=1.2` in the same formula. Stage 2 keeps
+`algo.student_perception_rollout_noise_scale=1.0` in the same formula. Stage 2 keeps
 its normal FlashSAC sampling (scale 1.0). The teacher's
 predicted std comes from the checkpoint, not directly from `temp_target_sigma`.
 
-1. For `algo.perception_warmup_iters` **new** iterations (current default 100; set
-   `algo.perception_warmup_iters=3000` for the full perception warmup), the frozen teacher rolls out
+1. For `algo.perception_warmup_iters` **new** iterations (default 500), the frozen teacher rolls out
    with its normal FlashSAC exploration noise, including before any replay exists. Depth
    CNN/GRU, object estimator and adaptation GRU train from short contiguous rollouts using
    object MSE and privileged-latent MSE against the frozen teacher encoder. `actor_adapt`
@@ -202,6 +201,14 @@ predicted std comes from the checkpoint, not directly from `temp_target_sigma`.
    critic/target critic, temperature and reward-normalization statistics are retained.
    Fresh RL optimizers/schedules start; the warm-start actor fills an empty replay until
    `buffer_min_length=100000`, then SAC updates begin. No uniform random warmup is used.
+   This first SAC phase lasts `algo.rl_phase_iters` (default 1000).
+3. Then `algo.num_cycles` repeated cycles (default 10; 0 = one-shot warmup) each run a
+   warmup set of `algo.cycle_warmup_iters` (default 300) and a SAC phase of
+   `algo.cycle_rl_phase_iters` (default 500); `num_cycles` does not count the first cycle.
+   With `algo.cycle_warmup_mode=perception_only` (default) the frozen student SAC actor rolls
+   out and only perception trains; `original` repeats the teacher warmup. Each set releases
+   the replay and resets environments; SAC optimizers and schedules continue. After the last
+   cycle, SAC runs to the end of training.
 
 On this skateboard task the actor input is 525 dimensions (`vel_command` 20 + full `policy`
 249 + frozen latent 256). The replay observation is **1856** dimensions: existing teacher
@@ -221,15 +228,27 @@ positions for the final action even though they are outside the 525-dimensional 
 Mean-action MSE does not supervise the stochastic std head; SAC trains it in Stage 2.
 
 W&B: `finetune/stage`, `finetune/warmup_iters_completed`, `finetune/iters_completed`,
+`finetune/cycles_completed`, `finetune/rl_phase_iters_completed`,
 `adapt/priv_loss`, `adapt/object_loss`, `adapt/adapt_loss`, `adapt/teacher_student_action_rmse`,
 latent/depth feature norms, and the existing FlashSAC actor/critic/temperature metrics.
 Evaluation uses the student path (EMA perception + actor_adapt), including Stage 1 checkpoints.
 
 Finetune checkpoints preserve the phase, counters, depth models, EMA and optimizer states.
-Resume with the same algorithm and `perception_warmup_iters`; Stage 2 resumes with frozen
+The cycle schedule comes from the current config, so a resume may change it (for example a
+larger `num_cycles` adds cycles; a warning lists the differences). Stage 2 resumes with frozen
 perception and refills replay (replay and simulator hidden states are not checkpointed).
 `total_frames` is the frame budget for the current invocation, including any remaining warmup.
-Set `algo.perception_warmup_iters=2` and smaller replay/batch/env counts for a short smoke test.
+For a short smoke test set `algo.perception_warmup_iters=2 algo.rl_phase_iters=2
+algo.num_cycles=1 algo.cycle_warmup_iters=2 algo.cycle_rl_phase_iters=2` and smaller
+replay/batch/env counts.
+
+CoSIL variant (`algo=cosil_flashsac_vel_finetune`, self-contained copy of this flow). It follows
+CoSIL (Nguyen et al., CoRL 2022) and regularizes the student SAC actor toward the frozen teacher
+with `D(s,h) = sum_j (tanh m_teacher,j(s) - tanh m_student,j(h))^2` and an adaptive `beta`:
+the critic target subtracts `beta*D(s',h')`, the actor loss adds `beta*D(s,h)`, and
+`beta` minimizes `beta*(target_divergence - E[D])`. `algo.cosil_mode=cosil` replaces FlashSAC's
+entropy term with this penalty (paper); `cosil_entropy` (default) keeps the entropy term and adds it.
+Defaults: `algo.target_divergence=0.5`, `algo.beta_init=0.1`.
 
 Teacher policy with PPO on the FlashSAC observation
 
