@@ -87,8 +87,8 @@ class CoSILFlashSACVelFinetuneConfig(FlashSACVelConfig):
     # normalized action space u = tanh(.), so it lies in [0, 4 * action_dim].
     cosil_mode: str = "cosil_entropy"
     # D-bar: beta grows while E[D] > target_divergence (imitate more), shrinks below it (more RL).
-    target_divergence: float = 0.5
-    beta_init: float = 0.1
+    target_divergence: float = 0.8
+    beta_init: float = 0.01
 
 
 ConfigStore.instance().store(
