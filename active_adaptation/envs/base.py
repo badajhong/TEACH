@@ -257,6 +257,8 @@ class _Env(EnvBase):
 
         self._stats_ema = {}
         self._perf_ema_reward = {}
+        # optional bool [num_envs]: only these envs enter the reward EMAs (set by some policies)
+        self.stats_env_mask = None
         self._stats_ema_decay = 0.99
 
         self.reward_groups: Dict[str, RewardGroup] = OrderedDict()
@@ -626,7 +628,14 @@ class RewardGroup:
             self.env.stats[self.name, key].add_(reward)
 
             sum, cnt = self.env._stats_ema[self.name][key]
-            sum.mul_(self.env._stats_ema_decay).add_(reward.sum())
+            mask = self.env.stats_env_mask
+            if mask is not None:
+                # count is per env (or its active envs); assume the same active share in the mask
+                count = count * mask.float().mean()
+                reward_sum = (reward * mask.unsqueeze(-1)).sum()
+            else:
+                reward_sum = reward.sum()
+            sum.mul_(self.env._stats_ema_decay).add_(reward_sum)
             cnt.mul_(self.env._stats_ema_decay).add_(count)
 
             sum_perf, cnt_perf = self.env._perf_ema_reward[self.name][key]

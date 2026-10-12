@@ -209,17 +209,22 @@ class NStepTrajectoryReplay:
     Observations may be stored in a lower precision (`obs_dtype`); sampled batches are float32.
     With `storage_device="cpu"` the data lives in RAM and each batch is gathered into pinned
     memory and copied to `device` asynchronously.
+
+    `include_one_step` also returns the first transition's next observation and continuation
+    from the same sampled row. This lets an auxiliary one-step objective share the n-step
+    reward replay without duplicating observation storage.
     """
 
     def __init__(
         self, num_envs, obs_dim, action_dim, n_step, gamma, max_length, min_length, batch_size, device,
-        obs_dtype=torch.float32, storage_device=None,
+        obs_dtype=torch.float32, storage_device=None, include_one_step=False,
     ):
         self.num_envs = num_envs
         self.n_step = n_step
         self.gamma = gamma
         self.min_length = min_length
         self.batch_size = batch_size
+        self.include_one_step = include_one_step
         self.device = torch.device(device)  # where sampled batches are used
         self.storage = torch.device(storage_device) if storage_device is not None else self.device
         self.T = max(max_length // num_envs, n_step + 2)
@@ -241,9 +246,11 @@ class NStepTrajectoryReplay:
             # reused pinned staging buffers and a separate stream, so copies do not queue behind the
             # training kernels and each batch lands in memory that is already mapped
             self._copy_stream = torch.cuda.Stream(self.device)
+            obs_blocks = 3 if include_one_step else 2
+            extra_scalars = 3 if include_one_step else 2
             self._staging = [
-                (torch.empty(2 * batch_size, obs_dim, dtype=obs_dtype, pin_memory=True),
-                 torch.empty(batch_size, action_dim + 2, pin_memory=True),
+                (torch.empty(obs_blocks * batch_size, obs_dim, dtype=obs_dtype, pin_memory=True),
+                 torch.empty(batch_size, action_dim + extra_scalars, pin_memory=True),
                  torch.cuda.Event())
                 for _ in range(4)
             ]
@@ -327,10 +334,16 @@ class NStepTrajectoryReplay:
             alive = alive & ~done
         cont = torch.where(alive, scale, cont)
 
-        rows = torch.cat([t * N + env, next_t * N + env])
+        row_blocks = [t * N + env, next_t * N + env]
+        if self.include_one_step:
+            row_blocks.append(((t + 1) % T) * N + env)
+        rows = torch.cat(row_blocks)
         obs_rows = self.obs.view(-1, self.obs.shape[-1])
         # upstream's critic target multiplies the bootstrap by (1 - terminated)
         parts = [self.action.view(T * N, -1).index_select(0, rows[:B]), n_step_reward[:, None], 1.0 - cont[:, None]]
+        if self.include_one_step:
+            one_step_cont = self.discount[t, env] * ~(self.done[t, env] & self.cut[t, env])
+            parts.append(1.0 - one_step_cont[:, None])
         if self.storage == self.device:
             obs, rest = obs_rows.index_select(0, rows), torch.cat(parts, dim=1)
         elif hasattr(self, "_staging") and B == self.batch_size:
@@ -339,13 +352,17 @@ class NStepTrajectoryReplay:
             obs, rest = obs_rows.index_select(0, rows).to(self.device), torch.cat(parts, dim=1).to(self.device)
         obs = obs.float()
         A = self.action.shape[-1]
-        return {
+        batch = {
             "observation": obs[:B],
             "action": rest[:, :A].contiguous(),
             "reward": rest[:, A].contiguous(),
             "terminated": rest[:, A + 1].contiguous(),
-            "next_observation": obs[B:],
+            "next_observation": obs[B:2 * B],
         }
+        if self.include_one_step:
+            batch["one_step_next_observation"] = obs[2 * B:]
+            batch["one_step_terminated"] = rest[:, A + 2].contiguous()
+        return batch
 
     def _to_device(self, obs_rows, rows, parts):
         obs_pinned, rest_pinned, copied = self._staging[self._staging_index]

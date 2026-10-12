@@ -250,6 +250,41 @@ the critic target subtracts `beta*D(s',h')`, the actor loss adds `beta*D(s,h)`, 
 entropy term with this penalty (paper); `cosil_entropy` (default) keeps the entropy term and adds it.
 Defaults: `algo.target_divergence=0.5`, `algo.beta_init=0.1`.
 
+TGRL variant (`algo=tgrl_flashsac_vel_finetune`, self-contained copy of this flow). It follows
+TGRL (Shenfeld et al., ICML 2023). SAC phases train two students on one replay: the exported
+`pi` maximizes `Q_R + c*(Q_I - cost(s,h))`, and the auxiliary `pi_R` maximizes `Q_R` only. Half the
+envs act with each. `pi` and `pi_R` use the FlashSAC student actor architecture. `Q_I` is a second FlashSAC
+categorical critic, with the same class, support and EMA target as `Q_R`. It learns the negative
+future imitation return using a one-step target `gamma*(1-done_1)*(Q_I(s[t+1],a')-cost(s[t+1],h[t+1]))`.
+This includes every future imitation cost while `Q_R` retains FlashSAC's n-step reward target.
+The default cost is `algo.tgrl_cost=kl`, the pre-tanh Gaussian `KL(student || teacher)` used by the
+linked TGRL implementation; `mse` remains an optional mean-action distance. The cost is clipped at
+`algo.tgrl_cost_clip` and scaled by `normalized_G_max*(1-gamma)/tgrl_cost_clip` so it fits that support. Every
+`algo.teacher_coef_update_iters` iterations, `c` moves by `+-algo.teacher_coef_update`, depending on
+whether `pi`'s mean finished-episode return beats `pi_R`'s. It is clipped to `[0, teacher_coef_max]`.
+Both actors train BatchNorm on concatenated current and n-step next observations, using only the
+current half for the actor loss, as in `flashsac_vel_finetune`.
+
+CoSIL + teacher intervention (`algo=gaddpg_cosil_flashsac_vel_finetune`, self-contained copy of the
+CoSIL variant). The CoSIL losses are unchanged, including the default `algo.cosil_mode=cosil_entropy`.
+`algo.cosil_mode=entropy` drops the CoSIL term and beta. Its SAC update is FlashSAC's own
+`_update_networks`, bit-identical to `flashsac_vel_finetune`, so teacher intervention is the only
+difference from that baseline. What changes is the SAC rollout:
+- A fraction `algo.intervention_env_fraction` (default 0.5) of the envs is mixed, spread evenly over
+  the env index. In a mixed env, the frozen teacher takes control when the student's mean action
+  diverges, `D(s,h) > tau`. It then keeps control for `algo.intervention_hold_steps` (10) steps.
+  Replay stores the executed action, which is the teacher's `tanh` mean during a takeover.
+- `tau` follows a target takeover rate over the mixed envs. Once per SAC iteration it updates
+  `log tau += algo.intervention_tau_lr*(rate - target)`. The target decays linearly from
+  `algo.intervention_rate_init` (0.6) to `algo.intervention_rate_end` (0) over
+  `algo.intervention_decay_fraction` (0.5) of all SAC iterations.
+- The n-step window of a replay row stops before the first later step whose action was the
+  teacher's. It bootstraps there with the student and a `gamma^k` discount, so the critic never
+  credits student actions with the teacher's corrections.
+- During SAC, `train/stats/*` and the env reward EMAs are computed from the pure-student envs
+  only. The intervention is logged under `gaddpg/*`. GA-DDPG (Wang et al., CoRL 2021) mixes expert
+  data into replay. This variant instead uses the teacher online, as an intervening controller.
+
 Teacher policy with PPO on the FlashSAC observation
 
 `ppo_vel_flat_train` isolates the effect of the input: PPO with `ppo_vel`'s networks, sizes and hyperparameters, reading the single flat vector `flashsac_vel_flat_train` builds instead of `ppo_vel_train`'s grouped tensors and adaptation modules.

@@ -67,7 +67,12 @@ def train_off_policy(cfg, env, policy, run, episode_stats, save, should_save):
                 time_limit = next_td["step_count"] >= env.max_episode_length
                 next_td["stats", "episode_time_limit"] = time_limit.float()
                 next_td["stats", "command_finished"] = (next_td["truncated"] & ~time_limit).float()
-                stats_buf.append(td.select(("next", "done"), ("next", "stats")))
+                step_stats = td.select(("next", "done"), ("next", "stats"))
+                # a policy may restrict logged episodes to some envs (e.g. its pure-student rollouts)
+                stats_mask = getattr(policy, "stats_env_mask", None)
+                if stats_mask is not None:
+                    step_stats["next", "done"] = step_stats["next", "done"] & stats_mask.unsqueeze(-1)
+                stats_buf.append(step_stats)
             training_start = time.perf_counter()
             policy.update()
             rollout_time += training_start - rollout_start
