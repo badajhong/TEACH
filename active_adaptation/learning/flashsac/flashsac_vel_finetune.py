@@ -216,6 +216,10 @@ class FlashSACVelFinetune(FlashSACVel):
             *range(policy_start, policy_end),
             *range(self.replay_obs_dim + self.vel_command_dim, self.student_replay_dim),
         ], device=self.device)
+        self._print_training_schedule()
+
+    def _print_training_schedule(self):
+        cfg = self.cfg
         if cfg.cycle_mode:
             print(f"[FlashSAC finetune] adaptive: teacher {cfg.perception_iters}, then direct SAC "
                   f"with reference from replay filling; SAC {cfg.cycle_sac_iters_min}..{cfg.cycle_sac_iters_max}, "
@@ -400,28 +404,7 @@ class FlashSACVelFinetune(FlashSACVel):
     @torch.no_grad()
     def add_transition(self, td):
         if self.stage == 1:
-            keys = [OBS_KEY, VEL_CMD_KEY, DEPTH_KEY, OBJECT_KEY, REF_JPOS_KEY,
-                    "is_init", "adapt_hx", "depth_hx"]
-            step = td.select(*keys)
-            # Teacher labels for _train_perception, computed per step (the teacher is frozen), so
-            # neither the full replay observation nor one large teacher call is needed later.
-            raw = self.replay_obs(td)
-            step[PRIV_FEATURE_KEY] = self.actor.encode_priv(raw)
-            if self.cfg.cycle_mode:
-                self._record_perception_error(td, target=step[PRIV_FEATURE_KEY])
-            mean, _ = self.actor.get_mean_and_std(raw, training=False)
-            step["_teacher_action"] = self._joint_action(torch.tanh(mean), td)
-            if self._adapt_t == 0:
-                # One [num_envs, train_every] buffer per iteration, filled in place.
-                n, t = step.shape[0], self.cfg.train_every
-                self._adapt_buffer = TensorDict(
-                    {k: torch.empty(n, t, *v.shape[1:], dtype=v.dtype, device=v.device)
-                     for k, v in step.items()}, batch_size=[n, t], device=self.device)
-            self._adapt_buffer[:, self._adapt_t] = step
-            self._adapt_t += 1
-            if self._adapt_t == self.cfg.train_every:
-                self._pending_adapt, self._adapt_buffer, self._adapt_t = self._adapt_buffer, None, 0
-                self._perception_iteration_ready = True
+            self._collect_perception_transition(td)
             return
 
         if self.cfg.cycle_mode:
@@ -461,6 +444,29 @@ class FlashSACVelFinetune(FlashSACVel):
             self.finetune_iters_completed += 1
             self.rl_phase_iters_completed += 1
             self._rl_steps_in_iteration = 0
+            self._perception_iteration_ready = True
+
+    @torch.no_grad()
+    def _collect_perception_transition(self, td):
+        keys = [OBS_KEY, VEL_CMD_KEY, DEPTH_KEY, OBJECT_KEY, REF_JPOS_KEY,
+                "is_init", "adapt_hx", "depth_hx"]
+        step = td.select(*keys)
+        # Frozen teacher labels are computed per step; retain only the short rollout.
+        raw = self.replay_obs(td)
+        step[PRIV_FEATURE_KEY] = self.actor.encode_priv(raw)
+        if self.cfg.cycle_mode:
+            self._record_perception_error(td, target=step[PRIV_FEATURE_KEY])
+        mean, _ = self.actor.get_mean_and_std(raw, training=False)
+        step["_teacher_action"] = self._joint_action(torch.tanh(mean), td)
+        if self._adapt_t == 0:
+            n, t = step.shape[0], self.cfg.train_every
+            self._adapt_buffer = TensorDict(
+                {k: torch.empty(n, t, *v.shape[1:], dtype=v.dtype, device=v.device)
+                 for k, v in step.items()}, batch_size=[n, t], device=self.device)
+        self._adapt_buffer[:, self._adapt_t] = step
+        self._adapt_t += 1
+        if self._adapt_t == self.cfg.train_every:
+            self._pending_adapt, self._adapt_buffer, self._adapt_t = self._adapt_buffer, None, 0
             self._perception_iteration_ready = True
 
     def _student_replay_obs(self, td, latent):
@@ -542,8 +548,10 @@ class FlashSACVelFinetune(FlashSACVel):
             self._start_perception()
 
     @set_recurrent_mode(True)
-    def _train_perception(self, rollout):
+    def _train_perception(self, rollout, *, distill_actor=None):
         # rollout already holds the teacher labels PRIV_FEATURE_KEY and _teacher_action.
+        if distill_actor is None:
+            distill_actor = not self.is_repeated_perception_phase
         infos = []
         for _ in range(self.cfg.adapt_epochs):
             for batch in make_batch(rollout, self.cfg.adapt_num_minibatches, self.cfg.train_every):
@@ -568,8 +576,8 @@ class FlashSACVelFinetune(FlashSACVel):
                     "adapt/priv_pred_norm": priv_pred_norm,
                     "adapt/depth_feature_norm": depth_feature_norm,
                 }
-                if self.is_repeated_perception_phase:
-                    # The SAC actor stays frozen; only monitor its distance from the teacher.
+                if not distill_actor:
+                    # Leave actor updates to SAC; only monitor distance from the teacher here.
                     with torch.no_grad():
                         student_mean, _ = self.actor_adapt.get_mean_and_std(inputs, training=False)
                         student_action = self._joint_action(
@@ -596,10 +604,14 @@ class FlashSACVelFinetune(FlashSACVel):
                     dst.lerp_(src, self.cfg.perception_ema_tau)
         return {k: torch.stack([i[k] for i in infos]).mean() for k in infos[0]}
 
-    def _start_rl(self, schedule_updates=None):
+    def _prepare_rl_perception(self):
         for pair in self._perception_pairs():
             for model in pair:
                 model.requires_grad_(False).eval()
+        return "perception and EMA frozen"
+
+    def _start_rl(self, schedule_updates=None):
+        perception_status = self._prepare_rl_perception()
         self.actor_adapt.requires_grad_(True)
         self.critic.requires_grad_(True)
         self.temperature.requires_grad_(True)
@@ -609,7 +621,7 @@ class FlashSACVelFinetune(FlashSACVel):
             self.cfg.cycle_mode and self._adaptive_schedule.reference_error is None)
         self.rl_phase_iters_completed = 0
         self._reset_phase_rollout()
-        print("[FlashSAC finetune] Stage 2: perception and EMA frozen; student SAC enabled. "
+        print(f"[FlashSAC finetune] Stage 2: {perception_status}; student SAC enabled. "
               f"Resetting environments/hidden states; replay starts empty ({self._last_transition_reason}).")
         if self._student is not None:
             # Continue SAC optimizer/scheduler state after repeated supervised perception phase.
@@ -900,12 +912,14 @@ class FlashSACVelFinetune(FlashSACVel):
         # not checkpointed, and RL resumes by filling a fresh buffer with the warm-start actor.
         self.needs_env_reset = False
         self.env.set_progress(self.finetune_iters_completed)
-        cycle_progress = (f"adaptive refreshes={self.cycles_completed}" if self.cfg.cycle_mode
-                          else f"repeated cycles={self.cycles_completed}/{self.cfg.num_cycles}")
         print(f"[FlashSAC finetune] {'resumed' if resume else 'loaded teacher'}; "
               f"stage={self.stage}, perception phase={self.perception_iters_completed}/{self._perception_length()}, "
-              f"{cycle_progress}")
+              f"{self._training_progress_summary()}")
         return []
+
+    def _training_progress_summary(self):
+        return (f"adaptive refreshes={self.cycles_completed}" if self.cfg.cycle_mode
+                else f"repeated cycles={self.cycles_completed}/{self.cfg.num_cycles}")
 
     def _warn_schedule_change(self, state):
         # The cycle schedule comes from the config, so it may change on resume (e.g. more cycles).

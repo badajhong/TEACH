@@ -19,6 +19,7 @@ ALGORITHMS = (
     ("flashsac_vel_flat_train", "flashsac_vel_flat", "FlashSACVelFlat"),
     ("flashsac_vel_train", "flashsac_vel", "FlashSACVel"),
     ("flashsac_vel_finetune", "flashsac_vel_finetune", "FlashSACVelFinetune"),
+    ("joint_flashsac_vel_finetune", "joint_flashsac_vel_finetune", "JointFlashSACVelFinetune"),
     ("cosil_flashsac_vel_finetune", "cosil_flashsac_vel_finetune", "CoSILFlashSACVelFinetune"),
     ("gaddpg_cosil_flashsac_vel_finetune", "gaddpg_cosil_flashsac_vel_finetune",
      "GADDPGCoSILFlashSACVelFinetune"),

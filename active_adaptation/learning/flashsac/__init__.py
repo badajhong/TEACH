@@ -8,6 +8,7 @@ __all__ = [
     "flashsac_vel_flat",
     "flashsac_vel",
     "flashsac_vel_finetune",
+    "joint_flashsac_vel_finetune",
     "cosil_flashsac_vel_finetune",
     "tgrl_flashsac_vel_finetune",
     "gaddpg_cosil_flashsac_vel_finetune",

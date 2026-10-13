@@ -336,6 +336,43 @@ algo.sac_iters=2 algo.num_cycles=1 algo.cycle_perception_iters=2 algo.cycle_sac_
 The self-contained CoSIL, TGRL and GADDPG variants below retain their fixed schedules;
 these new adaptive settings apply to `flashsac_vel_finetune`.
 
+Joint perception and SAC (`algo=joint_flashsac_vel_finetune`)
+
+```bash
+python scripts/train.py \
+  algo=joint_flashsac_vel_finetune \
+  task=G1/vaic/skateboard_general_tracking_stu \
+  checkpoint_path=/path/to/flashsac_vel_teacher.pt \
+  algo.buffer_max_length=8000000
+```
+
+This variant starts student rollout and perception training immediately
+(`perception_iters=0`). SAC updates begin once `buffer_min_length` transitions are
+ready. Every `train_every` steps, perception trains on the latest depth/GRU rollout
+with the existing privileged-latent and object supervision losses, then updates
+its EMA. Actor and critic updates use the existing FlashSAC losses. The teacher
+remains fixed; the joint actor receives no additional behavior-cloning update.
+SAC gradients do not flow through stored latents into perception.
+
+There are no cycle, trigger, plateau or final-SAC-tail options. Perception stays
+trainable throughout SAC, with no phase resets of replay or recurrent states.
+Collected latents and hidden states are used as-is, without recomputing them after
+perception updates. Depth sequences live only in the short perception buffer;
+the long SAC replay keeps the same flat observations and collected latents as
+`flashsac_vel_finetune`.
+
+The other defaults match `flashsac_vel_finetune`, including the 10-million-row CPU
+replay. The example uses 8 million rows (about 28.45 GiB for this task, versus
+35.56 GiB at 10 million) to leave more host RAM available. An optional initial
+teacher-only warmup can be enabled with `algo.perception_iters=500`.
+
+W&B logs `finetune/joint_active`, `finetune/joint_iters_completed`,
+`finetune/joint_perception_iters_completed`, the `adapt/*` losses, and existing
+SAC metrics. `finetune/stage=2` means joint training here. Joint checkpoints save
+both perception and SAC optimizer states and resume with empty replay; their
+method is distinct from alternating finetune checkpoints. Start from a
+`flashsac_vel` teacher checkpoint or resume a joint checkpoint.
+
 CoSIL variant (`algo=cosil_flashsac_vel_finetune`, self-contained copy of this flow). It follows
 CoSIL (Nguyen et al., CoRL 2022) and regularizes the student SAC actor toward the frozen teacher
 with `D(s,h) = sum_j (tanh m_teacher,j(s) - tanh m_student,j(h))^2` and an adaptive `beta`:
