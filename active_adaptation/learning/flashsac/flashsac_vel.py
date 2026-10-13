@@ -31,10 +31,10 @@ from torchrl.envs.transforms import TensorDictPrimer
 from termcolor import colored
 
 from ..modules.rnn import set_recurrent_mode
-from .common import ACTION_KEY, CMD_KEY, OBS_KEY, OBS_PRIV_KEY, CatTensors, make_batch, make_conv, make_mlp
+from ..ppo.common import ACTION_KEY, CMD_KEY, OBS_KEY, OBS_PRIV_KEY, CatTensors, make_batch, make_conv, make_mlp
 from .flashsac_upstream.agent import _sample_flashsac_actions, _update_networks
 from .flashsac_upstream.network import FlashSACActor
-from .flashsac_upstream.scheduler import warmup_cosine_decay_scheduler
+from .flashsac_upstream.scheduler import ramp_cosine_decay_scheduler
 from .flashsac_upstream.utils_network import Network
 from .flashsac_vel_flat import (
     ACTION_DR_KEY,
@@ -44,7 +44,7 @@ from .flashsac_vel_flat import (
     NStepTrajectoryReplay,
     _raw,
 )
-from .ppo_vel import (
+from ..ppo.ppo_vel import (
     HEIGHT_KEY,
     OBJECT_GEO_KEY,
     OBJECT_KEY,
@@ -66,7 +66,7 @@ DEPTH_FEATURE_KEY = "_depth_feature"
 
 @dataclass
 class FlashSACVelConfig(FlashSACVelFlatConfig):
-    _target_: str = "active_adaptation.learning.ppo.flashsac_vel.FlashSACVel"
+    _target_: str = "active_adaptation.learning.flashsac.flashsac_vel.FlashSACVel"
     name: str = "flashsac_vel"
 
     # PPOVEL-compatible privileged/adaptation architecture.
@@ -415,11 +415,11 @@ class FlashSACVel(FlashSACVelFlat):
         optimizer = optim.Adam(actor_net.parameters(), lr=cfg.learning_rate_peak, fused=use_fused)
         num_interaction_steps = max(1, cfg.num_env_steps // self.num_envs)
         num_updates = num_interaction_steps * cfg.updates_per_interaction_step
-        schedule = warmup_cosine_decay_scheduler(
+        schedule = ramp_cosine_decay_scheduler(
             init_value=cfg.learning_rate_init,
             peak_value=cfg.learning_rate_peak,
             end_value=cfg.learning_rate_end,
-            warmup_steps=int(cfg.learning_rate_warmup_rate * num_updates),
+            ramp_steps=int(cfg.learning_rate_ramp_rate * num_updates),
             decay_steps=int(cfg.learning_rate_decay_rate * num_updates),
         )
         scheduler = torch.optim.lr_scheduler.LambdaLR(

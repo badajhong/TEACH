@@ -10,12 +10,12 @@ from types import SimpleNamespace
 import torch
 from torchrl.data import Composite, Unbounded
 
-from active_adaptation.learning.ppo.flashsac_vel import FlashSACVel, FlashSACVelConfig
-from active_adaptation.learning.ppo.flashsac_vel_finetune import (
+from active_adaptation.learning.flashsac.flashsac_vel import FlashSACVel, FlashSACVelConfig
+from active_adaptation.learning.flashsac.flashsac_vel_finetune import (
     FlashSACVelFinetune, FlashSACVelFinetuneConfig,
 )
-from active_adaptation.learning.ppo.flashsac_vel_flat import U_KEY
-from active_adaptation.learning.ppo.gaddpg_cosil_flashsac_vel_finetune import (
+from active_adaptation.learning.flashsac.flashsac_vel_flat import U_KEY
+from active_adaptation.learning.flashsac.gaddpg_cosil_flashsac_vel_finetune import (
     INTERVENED_KEY, GADDPGCoSILFlashSACVelFinetune, GADDPGCoSILFlashSACVelFinetuneConfig,
 )
 
@@ -52,7 +52,7 @@ class GADDPGFinetuneTest(unittest.TestCase):
             critic_state_encoder_dim=8, critic_action_encoder_dim=8, critic_num_bins=11,
             adapt_num_minibatches=2, buffer_max_length=128, buffer_min_length=16,
             sample_batch_size=8, updates_per_interaction_step=1,
-            perception_warmup_iters=2, adapt_epochs=1,
+            perception_iters=2, adapt_epochs=1,
         )
         teacher = FlashSACVel(FlashSACVelConfig(**{k: v for k, v in self.options.items()
                                                    if k in FlashSACVelConfig.__dataclass_fields__}),
@@ -70,7 +70,7 @@ class GADDPGFinetuneTest(unittest.TestCase):
         return p
 
     def baseline(self):
-        cfg = FlashSACVelFinetuneConfig(**self.options)
+        cfg = FlashSACVelFinetuneConfig(**self.options, cycle_mode=False)
         p = FlashSACVelFinetune(cfg, self.spec, self.action_spec, None, "cpu", self.env)
         p.load_state_dict(copy.deepcopy(self.teacher_state))
         return p
@@ -151,8 +151,11 @@ class GADDPGFinetuneTest(unittest.TestCase):
         reset["is_init"][1] = True
         td = p.get_rollout_policy("train")(reset)
         self.assertTrue(torch.equal(td[INTERVENED_KEY], torch.tensor([False, False, False, True])))
-        # warmup clears the logging mask; evaluation rollouts never intervene
-        p._start_warmup()
+        # perception training clears the logging mask; evaluation rollouts never intervene
+        p.cycles_completed = 1
+        p._start_perception()
+        self.assertTrue(p.is_repeated_perception_phase)
+        self.assertTrue(all(not x.requires_grad for x in p.actor_adapt.parameters()))
         self.assertIsNone(p.stats_env_mask)
         self.assertIsNone(self.env.stats_env_mask)
 

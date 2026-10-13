@@ -28,8 +28,8 @@ from termcolor import colored
 from torch.amp.grad_scaler import GradScaler
 from torchrl.envs.transforms import ObservationNorm, VecNorm
 
-from .common import ACTION_KEY, CMD_KEY, OBS_KEY, OBS_PRIV_KEY
-from .ppo_vel import (
+from ..ppo.common import ACTION_KEY, CMD_KEY, OBS_KEY, OBS_PRIV_KEY
+from ..ppo.ppo_vel import (
     HEIGHT_KEY,
     OBJECT_GEO_KEY,
     OBJECT_KEY,
@@ -58,7 +58,7 @@ ACTION_DR_KEY = "action_dr"
 
 @dataclass
 class FlashSACVelFlatConfig:
-    _target_: str = "active_adaptation.learning.ppo.flashsac_vel_flat.FlashSACVelFlat"
+    _target_: str = "active_adaptation.learning.flashsac.flashsac_vel_flat.FlashSACVelFlat"
     name: str = "flashsac_vel_flat"
     # FlashSAC normalizes its inputs with the BatchNorm embedder, so it consumes raw observations
     vecnorm: Union[str, None] = None
@@ -126,7 +126,7 @@ class FlashSACVelFlatConfig:
     learning_rate_init: float = 1e-4    #3e-4
     learning_rate_peak: float = 1e-4    #3e-4
     learning_rate_end: float = 1e-4     #1.5e-4
-    learning_rate_warmup_rate: float = 1e-6
+    learning_rate_ramp_rate: float = 1e-6
     learning_rate_decay_rate: float = 1.0
 
     actor_num_blocks: int = 2
@@ -531,8 +531,8 @@ class FlashSACVelFlat(TensorDictModuleBase):
             learning_rate_init=cfg.learning_rate_init,
             learning_rate_peak=cfg.learning_rate_peak,
             learning_rate_end=cfg.learning_rate_end,
-            learning_rate_warmup_rate=cfg.learning_rate_warmup_rate,
-            learning_rate_warmup_step=int(cfg.learning_rate_warmup_rate * num_updates),
+            learning_rate_ramp_rate=cfg.learning_rate_ramp_rate,
+            learning_rate_ramp_step=int(cfg.learning_rate_ramp_rate * num_updates),
             learning_rate_decay_rate=cfg.learning_rate_decay_rate,
             learning_rate_decay_step=int(cfg.learning_rate_decay_rate * num_updates),
             actor_num_blocks=cfg.actor_num_blocks,

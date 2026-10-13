@@ -1,7 +1,7 @@
 """CPU regressions for TGRL targets, actor inputs and compiled-output ownership.
 
 Run: PYTHONPATH=. python -m unittest discover -s tests -p test_tgrl_flashsac_vel_finetune.py
-The inherited tests also exercise perception warmup, replay and checkpoint transfer.
+The inherited tests also exercise perception training, replay and checkpoint transfer.
 """
 import copy
 import unittest
@@ -10,13 +10,14 @@ from unittest import mock
 import torch
 
 import test_flashsac_vel_finetune as finetune_fixture
-from active_adaptation.learning.ppo import tgrl_flashsac_vel_finetune as tgrl
+from active_adaptation.learning.flashsac import tgrl_flashsac_vel_finetune as tgrl
 
 
 class TGRLFinetuneTest(finetune_fixture.FinetuneTest):
+    checkpoint_version = 6
     def new_policy(self):
         cfg = tgrl.TGRLFlashSACVelFinetuneConfig(
-            **self.options, perception_warmup_iters=2, adapt_epochs=1)
+            **self.options, perception_iters=2, adapt_epochs=1)
         return tgrl.TGRLFlashSACVelFinetune(
             cfg, self.spec, self.action_spec, None, "cpu", self.env)
 

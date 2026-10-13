@@ -1,4 +1,4 @@
-"""Repeat original teacher-rollout warmup and SAC with frozen perception.
+"""Alternate perception training and SAC with frozen perception.
 
 Only the short Stage 1 rollout contains depth/hidden states. Stage 2 replay stores the
 teacher replay fields followed by velocity commands and the frozen student latent.
@@ -7,6 +7,7 @@ Actions keep the teacher's residual/absolute convention, including ref_joint_pos
 
 import copy
 from dataclasses import dataclass
+from numbers import Integral
 from typing import List
 
 import torch
@@ -17,48 +18,80 @@ from tensordict.nn import TensorDictModuleBase, TensorDictSequential as Seq
 from torchrl.data import Unbounded
 from torchrl.envs.transforms import TensorDictPrimer
 
-from .common import ACTION_KEY, OBS_KEY, CatTensors, make_batch, make_conv
+from ..ppo.common import ACTION_KEY, OBS_KEY, CatTensors, make_batch, make_conv
 from .flashsac_vel import FlashSACVel, FlashSACVelConfig
 from .flashsac_vel_flat import ACTION_DR_KEY, U_KEY, FlashSACVelFlat, NStepTrajectoryReplay
 from .flashsac_upstream.agent import _sample_flashsac_actions, _update_networks
-from .flashsac_upstream.scheduler import warmup_cosine_decay_scheduler
+from .flashsac_upstream.scheduler import ramp_cosine_decay_scheduler
 from .flashsac_upstream.utils_network import Network
-from .ppo_vel import (
+from .finetune_schedule import AdaptivePerceptionSchedule, validate_config as validate_adaptive_config
+from ..ppo.ppo_vel import (
     DEPTH_KEY, VEL_CMD_KEY, OBJECT_KEY, OBJECT_PRED_KEY, OBJECT_PRED_TRANS_KEY,
     PRIV_FEATURE_KEY, PRIV_PRED_KEY, REF_JPOS_KEY, TemporalDepthGRU,
 )
 from ..modules.rnn import set_recurrent_mode
 
 
+_ADAPTIVE_SCHEDULE_FIELDS = (
+    "perception_trigger", "perception_error_window", "perception_trigger_patience",
+    "plateau_window", "plateau_tol", "plateau_patience", "plateau_check_interval",
+    "cycle_perception_iters_min", "cycle_perception_iters_max",
+    "cycle_sac_iters_min", "cycle_sac_iters_max",
+)
+
+
 @dataclass
 class FlashSACVelFinetuneConfig(FlashSACVelConfig):
-    _target_: str = "active_adaptation.learning.ppo.flashsac_vel_finetune.FlashSACVelFinetune"
+    _target_: str = "active_adaptation.learning.flashsac.flashsac_vel_finetune.FlashSACVelFinetune"
     name: str = "flashsac_vel_finetune"
     num_envs: int = 4096
     # Depth comes from CUDA ray casting; headless training needs no RTX renderer.
     # train.py enables rendering again for eval_render=true.
     enable_rtx: bool = False
     updates_per_interaction_step: float = 8.0
-    # First cycle (always runs): teacher warmup set, then the first SAC phase.
-    perception_warmup_iters: int = 500
-    rl_phase_iters: int = 1000
-    # Repeated cycles after the first: a warmup set of cycle_warmup_iters, then a SAC phase of
-    # cycle_rl_phase_iters. num_cycles counts these repeats only; 0 = one-shot warmup.
+    # Adaptive mode: teacher perception -> SAC, then adaptive SAC/refresh cycles.
+    # The first error reference comes from student replay filling, with no extra phase.
+    # False preserves the fixed num_cycles schedule below.
+    cycle_mode: bool = True
+    # Pilot candidate from frozen-actor probes, not a guaranteed performance margin.
+    perception_trigger: float = 0.03
+    # Aggregate rollout MSE over this many iterations before taking its square root.
+    perception_error_window: int = 20
+    perception_trigger_patience: int = 3
+    # Compare two adjacent windows every check_interval; stop after patience checks
+    # with less than plateau_tol relative RMSE improvement (including deterioration).
+    plateau_window: int = 40
+    plateau_tol: float = 0.0018
+    plateau_patience: int = 3
+    plateau_check_interval: int = 10
+    cycle_perception_iters_min: int = 1
+    cycle_perception_iters_max: int = 300
+    cycle_sac_iters_min: int = 100
+    cycle_sac_iters_max: int = 1000
+    # At the nominal training budget, finish any current refresh naturally, then
+    # require this many uninterrupted SAC phase iterations (including replay fill).
+    # An existing SAC phase counts toward this length; 0 disables the final tail.
+    final_sac_iters: int = 200
+    # Initial teacher-rollout perception training, in both modes.
+    perception_iters: int = 500
+    # Fixed mode only: first SAC, followed by num_cycles repeats and final SAC.
+    # Adaptive mode ignores all four fixed schedule settings.
+    sac_iters: int = 1000
+    # Repeated cycles after the first: a perception phase of cycle_perception_iters, then a SAC phase of
+    # cycle_sac_iters. num_cycles counts these repeats only; 0 = one-shot perception phase.
     # After the last repeat, SAC runs to the end of training.
     num_cycles: int = 10
-    cycle_warmup_iters: int = 300
-    cycle_rl_phase_iters: int = 500
-    # Cycle warmup sets: "perception_only" rolls out the frozen student SAC actor
-    # (temperature 1.0) and trains perception only; "original" repeats the teacher warmup.
-    cycle_warmup_mode: str = "perception_only"
+    cycle_perception_iters: int = 300
+    cycle_sac_iters: int = 500
+    # Repeated perception phases use the frozen student SAC actor and train perception only.
     # Stage 1 rollout noise: u = tanh(mean + std * noise * scale). Stage 2 SAC always uses 1.0.
-    teacher_perception_rollout_noise_scale: float = 1.6  # first set (and "original" cycles)
-    student_perception_rollout_noise_scale: float = 1.0  # "perception_only" cycle sets
+    teacher_perception_rollout_noise_scale: float = 1.6  # initial perception phase
+    student_perception_rollout_noise_scale: float = 1.0  # repeated perception phases
     adapt_epochs: int = 2
     perception_ema_tau: float = 0.08
     in_keys: List[str] = (*FlashSACVelConfig.in_keys, DEPTH_KEY)
-    # Cosine decay from learning_rate_peak to learning_rate_end over all SAC updates of the run
-    # (length from total_frames, i.e. num_env_steps, and the cycle schedule).
+    # Fixed mode: decay over the estimated SAC update budget. Adaptive mode: use
+    # global environment-step progress after teacher perception, including refreshes.
     learning_rate_end: float = 1e-5
     buffer_max_length: int = 10_000_000
     # Rows before SAC updates start, after every replay reset (first SAC phase and each cycle).
@@ -92,7 +125,7 @@ class FinetuneRollout(TensorDictModuleBase):
         if ACTION_DR_KEY in p.replay_keys:
             td[ACTION_DR_KEY] = p.action_dr()
         p._perceive(td, ema=True)
-        teacher_rollout = self.train_mode and p.stage == 1 and not p.perception_only_warmup
+        teacher_rollout = self.train_mode and p.stage == 1 and not p.is_repeated_perception_phase
         if teacher_rollout:
             network, observation = p._actor, p.replay_obs(td)
         else:
@@ -118,16 +151,20 @@ class FinetuneRollout(TensorDictModuleBase):
 
 class FlashSACVelFinetune(FlashSACVel):
     def __init__(self, cfg, observation_spec, action_spec, reward_spec, device, env):
-        if cfg.perception_warmup_iters < 0 or cfg.adapt_epochs < 1:
-            raise ValueError("perception_warmup_iters must be >= 0 and adapt_epochs >= 1")
-        schedule = (cfg.rl_phase_iters, cfg.cycle_warmup_iters, cfg.cycle_rl_phase_iters)
-        if cfg.num_cycles < 0 or min(schedule) < 0:
-            raise ValueError("num_cycles, rl_phase_iters and cycle_*_iters must be >= 0")
-        if cfg.num_cycles > 0 and min(schedule) < 1:
-            raise ValueError("repeated cycles need rl_phase_iters, cycle_warmup_iters and "
-                             "cycle_rl_phase_iters >= 1")
-        if cfg.cycle_warmup_mode not in ("perception_only", "original"):
-            raise ValueError("cycle_warmup_mode must be 'perception_only' or 'original'")
+        if cfg.perception_iters < 0 or cfg.adapt_epochs < 1:
+            raise ValueError("perception_iters must be >= 0 and adapt_epochs >= 1")
+        if cfg.cycle_mode:
+            validate_adaptive_config(cfg)
+            if (isinstance(cfg.final_sac_iters, bool)
+                    or not isinstance(cfg.final_sac_iters, Integral) or cfg.final_sac_iters < 0):
+                raise ValueError("final_sac_iters must be a nonnegative integer")
+        else:
+            schedule = (cfg.sac_iters, cfg.cycle_perception_iters, cfg.cycle_sac_iters)
+            if cfg.num_cycles < 0 or min(schedule) < 0:
+                raise ValueError("num_cycles, sac_iters and cycle_*_iters must be >= 0")
+            if cfg.num_cycles > 0 and min(schedule) < 1:
+                raise ValueError("repeated cycles need sac_iters, cycle_perception_iters and "
+                                 "cycle_sac_iters >= 1")
         for name in ("teacher_perception_rollout_noise_scale", "student_perception_rollout_noise_scale"):
             if not 0 <= getattr(cfg, name) < float("inf"):
                 raise ValueError(f"{name} must be finite and >= 0")
@@ -143,10 +180,24 @@ class FlashSACVelFinetune(FlashSACVel):
         if self.num_envs < cfg.adapt_num_minibatches or self.num_envs % cfg.adapt_num_minibatches:
             raise ValueError("num_envs must be divisible by adapt_num_minibatches")
         self.stage = 1
-        self.warmup_iters_completed = 0
+        self.perception_iters_completed = 0
         self.rl_phase_iters_completed = 0
         self.cycles_completed = 0
+        # Explicit phase flag also supports older checkpoints with an initial refresh.
+        self._student_perception_phase = False
+        self._adaptive_schedule = AdaptivePerceptionSchedule(cfg) if cfg.cycle_mode else None
+        self._initial_reference_pending = bool(cfg.cycle_mode)
+        self._perception_error_sum = torch.zeros((), dtype=torch.float64, device=self.device)
+        self._perception_error_count = torch.zeros((), dtype=torch.int64, device=self.device)
+        self._perception_iteration_ready = False
+        self._last_schedule_info = {}
+        self._last_transition_reason = "initial_teacher"
+        self._adaptive_lr_start_iter = cfg.perception_iters
+        self._adaptive_lr_num_steps = max(
+            1, cfg.num_env_steps // self.num_envs - cfg.perception_iters * cfg.train_every)
         self.finetune_iters_completed = 0
+        self._training_target_iter = None
+        self._final_sac_active = False
         self._rl_steps_in_iteration = 0
         self._checkpoint_loaded = False
         self.needs_env_reset = False
@@ -165,27 +216,76 @@ class FlashSACVelFinetune(FlashSACVel):
             *range(policy_start, policy_end),
             *range(self.replay_obs_dim + self.vel_command_dim, self.student_replay_dim),
         ], device=self.device)
-        print(f"[FlashSAC finetune] first cycle: warmup {cfg.perception_warmup_iters} + SAC "
-              f"{cfg.rl_phase_iters} iterations; then {cfg.num_cycles} x (warmup "
-              f"{cfg.cycle_warmup_iters} + SAC {cfg.cycle_rl_phase_iters}) "
-              f"(cycle mode {cfg.cycle_warmup_mode}); "
-              f"student replay {self.student_replay_dim}, critic input {self.obs_dim} dims.")
+        if cfg.cycle_mode:
+            print(f"[FlashSAC finetune] adaptive: teacher {cfg.perception_iters}, then direct SAC "
+                  f"with reference from replay filling; SAC {cfg.cycle_sac_iters_min}..{cfg.cycle_sac_iters_max}, "
+                  f"RMSE trigger +{cfg.perception_trigger:.1%}; refresh "
+                  f"{cfg.cycle_perception_iters_min}..{cfg.cycle_perception_iters_max} iterations.")
+        else:
+            print(f"[FlashSAC finetune] first cycle: perception phase {cfg.perception_iters} + SAC "
+                  f"{cfg.sac_iters} iterations; then {cfg.num_cycles} x (perception phase "
+                  f"{cfg.cycle_perception_iters} + SAC {cfg.cycle_sac_iters}).")
 
     @property
-    def perception_only_warmup(self):
-        return (self.stage == 1 and self.cycles_completed > 0 and
-                self.cfg.cycle_warmup_mode == "perception_only")
+    def is_repeated_perception_phase(self):
+        return self.stage == 1 and (self._student_perception_phase or self.cycles_completed > 0)
 
-    def _warmup_length(self):
-        return self.cfg.perception_warmup_iters if self.cycles_completed == 0 else self.cfg.cycle_warmup_iters
+    def _perception_length(self):
+        if self.cfg.cycle_mode and getattr(self, "_student_perception_phase", False):
+            return self.cfg.cycle_perception_iters_max
+        if getattr(self, "_student_perception_phase", False):
+            return self.cfg.cycle_perception_iters
+        return self.cfg.perception_iters if self.cycles_completed == 0 else self.cfg.cycle_perception_iters
 
     def _rl_phase_length(self):
-        return self.cfg.rl_phase_iters if self.cycles_completed == 0 else self.cfg.cycle_rl_phase_iters
+        if self.cfg.cycle_mode:
+            return self.cfg.cycle_sac_iters_max
+        return self.cfg.sac_iters if self.cycles_completed == 0 else self.cfg.cycle_sac_iters
+
+    def configure_training_budget(self, total_iters):
+        """Set this invocation's additional nominal budget before collecting data.
+
+        A checkpoint already finishing its final SAC tail retains that pending
+        intent and its original target. Ordinary resumes receive a new budget.
+        """
+        if isinstance(total_iters, bool) or not isinstance(total_iters, Integral) or total_iters < 0:
+            raise ValueError("training budget must be a nonnegative number of iterations")
+        if not (self.cfg.cycle_mode and self.cfg.final_sac_iters > 0 and self._final_sac_active):
+            self._training_target_iter = self.finetune_iters_completed + int(total_iters)
+            self._final_sac_active = False
+        self._activate_final_sac_if_due()
+
+    def _activate_final_sac_if_due(self):
+        # Called only after complete iterations (or budget configuration), before
+        # considering another SAC -> perception transition at the same boundary.
+        if (self.cfg.cycle_mode and self.cfg.final_sac_iters > 0
+                and self._training_target_iter is not None
+                and self.finetune_iters_completed >= self._training_target_iter
+                and not self._final_sac_active):
+            self._final_sac_active = True
+            print("[FlashSAC finetune] Nominal training budget reached; finishing the current "
+                  "perception phase if needed, then requiring "
+                  f"{self.cfg.final_sac_iters} uninterrupted SAC phase iterations.")
+
+    def training_complete(self):
+        """Whether the configured budget and any pending final SAC tail are done."""
+        if self._training_target_iter is None or self.finetune_iters_completed < self._training_target_iter:
+            return False
+        if not self.cfg.cycle_mode or self.cfg.final_sac_iters == 0:
+            return True
+        return (self._final_sac_active and self.stage == 2
+                and self.rl_phase_iters_completed >= self.cfg.final_sac_iters)
+
+    def _final_sac_iters_remaining(self):
+        if not self._final_sac_active:
+            return 0
+        completed = self.rl_phase_iters_completed if self.stage == 2 else 0
+        return max(0, self.cfg.final_sac_iters - completed)
 
     def _rollout_noise_scale(self, teacher_rollout):
         if teacher_rollout:
             return self.cfg.teacher_perception_rollout_noise_scale
-        if self.perception_only_warmup:
+        if self.is_repeated_perception_phase:
             return self.cfg.student_perception_rollout_noise_scale
         return 1.0
 
@@ -260,15 +360,55 @@ class FlashSACVelFinetune(FlashSACVel):
         return self.cfg.action_scale * u
 
     @torch.no_grad()
+    def _record_perception_error(self, td, target=None):
+        # Use the deployed EMA prediction that produced this action, before any
+        # next-state perception/compiled call can reuse its output storage.
+        if target is None:
+            target = self.actor.encode_priv(self.replay_obs(td))
+        error = (td[PRIV_PRED_KEY].float() - target.float()).square().mean(-1).reshape(-1)
+        valid = td["step_count"].reshape(-1) > 1
+        self._perception_error_sum.add_(torch.where(valid, error, 0.).sum(dtype=torch.float64))
+        self._perception_error_count.add_(valid.sum())
+
+    def _finish_perception_measurement(self):
+        # Only synchronize once per complete iteration; no depth is kept in SAC
+        # replay for monitoring. The controller retains just scalar sums/counts.
+        if self._adaptive_schedule is not None:
+            self._adaptive_schedule.observe(
+                self._perception_error_sum.item(), self._perception_error_count.item())
+        self._perception_error_sum.zero_()
+        self._perception_error_count.zero_()
+        self._perception_iteration_ready = False
+
+    def _capture_schedule_info(self):
+        schedule = self._adaptive_schedule
+        if schedule is None:
+            return
+        self._last_schedule_info = {
+            "finetune/measurement_stage": self.stage,
+            "finetune/measurement_student_rollout": int(self.stage == 2 or self.is_repeated_perception_phase),
+            **{f"finetune/{key}": value for key, value in {
+                "perception_ema_rmse": schedule.last_error,
+                "perception_ema_rmse_smoothed": schedule.smoothed_error,
+                "relative_error": schedule.relative_error,
+                "plateau_improvement": schedule.plateau_improvement,
+                "trigger_streak": schedule.trigger_streak,
+                "plateau_streak": schedule.plateau_streak,
+            }.items() if value is not None},
+        }
+
+    @torch.no_grad()
     def add_transition(self, td):
         if self.stage == 1:
             keys = [OBS_KEY, VEL_CMD_KEY, DEPTH_KEY, OBJECT_KEY, REF_JPOS_KEY,
                     "is_init", "adapt_hx", "depth_hx"]
             step = td.select(*keys)
-            # Teacher labels for _train_warmup, computed per step (the teacher is frozen), so
+            # Teacher labels for _train_perception, computed per step (the teacher is frozen), so
             # neither the full replay observation nor one large teacher call is needed later.
             raw = self.replay_obs(td)
             step[PRIV_FEATURE_KEY] = self.actor.encode_priv(raw)
+            if self.cfg.cycle_mode:
+                self._record_perception_error(td, target=step[PRIV_FEATURE_KEY])
             mean, _ = self.actor.get_mean_and_std(raw, training=False)
             step["_teacher_action"] = self._joint_action(torch.tanh(mean), td)
             if self._adapt_t == 0:
@@ -281,8 +421,11 @@ class FlashSACVelFinetune(FlashSACVel):
             self._adapt_t += 1
             if self._adapt_t == self.cfg.train_every:
                 self._pending_adapt, self._adapt_buffer, self._adapt_t = self._adapt_buffer, None, 0
+                self._perception_iteration_ready = True
             return
 
+        if self.cfg.cycle_mode:
+            self._record_perception_error(td)
         next_td = td["next"]
         if ACTION_DR_KEY in self.replay_keys:
             next_td[ACTION_DR_KEY] = td[ACTION_DR_KEY]
@@ -318,6 +461,7 @@ class FlashSACVelFinetune(FlashSACVel):
             self.finetune_iters_completed += 1
             self.rl_phase_iters_completed += 1
             self._rl_steps_in_iteration = 0
+            self._perception_iteration_ready = True
 
     def _student_replay_obs(self, td, latent):
         return torch.cat([self.replay_obs(td), td[VEL_CMD_KEY], latent], dim=-1)
@@ -344,25 +488,61 @@ class FlashSACVelFinetune(FlashSACVel):
     def update(self):
         if self.stage == 1:
             if self._pending_adapt is not None:
-                info = self._train_warmup(self._pending_adapt)
+                info = self._train_perception(self._pending_adapt)
                 self._pending_adapt = None
                 for key, value in info.items():
                     self._info_sum[key] = self._info_sum.get(key, 0.) + value.detach()
                     self._info_cnt[key] = self._info_cnt.get(key, 0) + 1
-                self.warmup_iters_completed += 1
+                self.perception_iters_completed += 1
                 self.finetune_iters_completed += 1
-                if self.warmup_iters_completed >= self._warmup_length():
+                self._finish_perception_measurement()
+                self._activate_final_sac_if_due()
+                if self.cfg.cycle_mode and self.is_repeated_perception_phase:
+                    reason = self._adaptive_schedule.refresh_reason(self.perception_iters_completed)
+                    if reason:
+                        self._adaptive_schedule.establish_reference()
+                        self._initial_reference_pending = False
+                    self._capture_schedule_info()
+                    if reason:
+                        self._last_transition_reason = reason
+                        self._start_rl()
+                elif self.perception_iters_completed >= self._perception_length():
+                    self._capture_schedule_info()
+                    if self.cfg.cycle_mode:
+                        self._last_transition_reason = "initial_sac"
                     self._start_rl()
+                else:
+                    self._capture_schedule_info()
             return
+        if self._initial_reference_pending and self.can_start_training():
+            # Capture the student error before the first eligible SAC update.
+            # Replay may become ready partway through an iteration: include that
+            # partial rollout without consuming it or postponing any updates.
+            if self._adaptive_schedule.try_initialize_reference(
+                    self._perception_error_sum.item(), self._perception_error_count.item()):
+                self._initial_reference_pending = False
+            # Missing/invalid observations leave the reference pending; SAC keeps
+            # its original update timing and the next valid rollout is retried.
         FlashSACVelFlat.update(self)
-        if (self.cycles_completed < self.cfg.num_cycles and
-                self._rl_steps_in_iteration == 0 and
-                self.rl_phase_iters_completed >= self._rl_phase_length()):
+        if not self._perception_iteration_ready:
+            return
+        self._finish_perception_measurement()
+        self._activate_final_sac_if_due()
+        if self.cfg.cycle_mode:
+            reason = (None if self._final_sac_active
+                      else self._adaptive_schedule.sac_reason(self.rl_phase_iters_completed))
+            self._capture_schedule_info()
+            if reason:
+                self.cycles_completed += 1
+                self._last_transition_reason = reason
+                self._start_perception(student=True)
+        elif (self.cycles_completed < self.cfg.num_cycles and
+              self.rl_phase_iters_completed >= self._rl_phase_length()):
             self.cycles_completed += 1
-            self._start_warmup()
+            self._start_perception()
 
     @set_recurrent_mode(True)
-    def _train_warmup(self, rollout):
+    def _train_perception(self, rollout):
         # rollout already holds the teacher labels PRIV_FEATURE_KEY and _teacher_action.
         infos = []
         for _ in range(self.cfg.adapt_epochs):
@@ -388,7 +568,7 @@ class FlashSACVelFinetune(FlashSACVel):
                     "adapt/priv_pred_norm": priv_pred_norm,
                     "adapt/depth_feature_norm": depth_feature_norm,
                 }
-                if self.perception_only_warmup:
+                if self.is_repeated_perception_phase:
                     # The SAC actor stays frozen; only monitor its distance from the teacher.
                     with torch.no_grad():
                         student_mean, _ = self.actor_adapt.get_mean_and_std(inputs, training=False)
@@ -424,38 +604,51 @@ class FlashSACVelFinetune(FlashSACVel):
         self.critic.requires_grad_(True)
         self.temperature.requires_grad_(True)
         self.stage = 2
+        self._student_perception_phase = False
+        self._initial_reference_pending = (
+            self.cfg.cycle_mode and self._adaptive_schedule.reference_error is None)
         self.rl_phase_iters_completed = 0
         self._reset_phase_rollout()
         print("[FlashSAC finetune] Stage 2: perception and EMA frozen; student SAC enabled. "
-              "Resetting environments/hidden states; replay starts empty.")
+              f"Resetting environments/hidden states; replay starts empty ({self._last_transition_reason}).")
         if self._student is not None:
-            # Continue SAC optimizer/scheduler state after repeated supervised warmup.
+            # Continue SAC optimizer/scheduler state after repeated supervised perception phase.
             return
         # Existing critic/temperature optimizers are fresh when loading a teacher. They
-        # have not stepped during warmup. Student SAC gets a separate fresh optimizer.
+        # have not stepped during perception phase. Student SAC gets a separate fresh optimizer.
         optimizer = optim.Adam(self.actor_adapt.parameters(), lr=self.cfg.learning_rate_peak,
                                fused=self.device.type == "cuda")
         te, horizon = self.cfg.train_every, self.cfg.num_env_steps // self.num_envs
-        # RL env steps in the horizon: first SAC phase, each repeated cycle's SAC phase, final SAC.
-        elapsed, steps = self.cfg.perception_warmup_iters * te, 0
-        phase = self.cfg.rl_phase_iters * te
-        for _ in range(self.cfg.num_cycles):
-            if elapsed + phase >= horizon:
-                break
-            steps += phase
-            elapsed += phase + self.cfg.cycle_warmup_iters * te
-            phase = self.cfg.cycle_rl_phase_iters * te
-        steps = max(1, steps + max(0, horizon - elapsed))
+        if self.cfg.cycle_mode:
+            # This upper bound does not predict future refresh durations. The LR
+            # clock below uses known global frame progress, not this update count.
+            steps = self._adaptive_lr_num_steps
+        else:
+            # Fixed schedule's existing SAC update budget.
+            elapsed, steps = self.cfg.perception_iters * te, 0
+            phase = self.cfg.sac_iters * te
+            for _ in range(self.cfg.num_cycles):
+                if elapsed + phase >= horizon:
+                    break
+                steps += phase
+                elapsed += phase + self.cfg.cycle_perception_iters * te
+                phase = self.cfg.cycle_sac_iters * te
+            steps = max(1, steps + max(0, horizon - elapsed))
         updates = schedule_updates or max(1, int(steps * self.cfg.updates_per_interaction_step))
         self._rl_schedule_updates = updates
 
         def lr_lambda(num_steps):
-            schedule = warmup_cosine_decay_scheduler(
+            if self.cfg.cycle_mode:
+                num_steps = self._adaptive_lr_num_steps
+            schedule = ramp_cosine_decay_scheduler(
                 init_value=self.cfg.learning_rate_init, peak_value=self.cfg.learning_rate_peak,
                 end_value=self.cfg.learning_rate_end,
-                warmup_steps=int(self.cfg.learning_rate_warmup_rate * num_steps),
+                ramp_steps=int(self.cfg.learning_rate_ramp_rate * num_steps),
                 decay_steps=max(1, int(self.cfg.learning_rate_decay_rate * num_steps)),
             )
+            if self.cfg.cycle_mode:
+                return lambda _: schedule(max(0, (self.finetune_iters_completed
+                                                  - self._adaptive_lr_start_iter) * te)) / self.cfg.learning_rate_peak
             return lambda step: schedule(step) / self.cfg.learning_rate_peak
 
         # Initialize schedules once; later cycles retain their SAC update progress. The critic
@@ -482,6 +675,11 @@ class FlashSACVelFinetune(FlashSACVel):
         self._adapt_buffer, self._adapt_t = None, 0
         self._pending_adapt = None
         self._rl_steps_in_iteration = 0
+        self._perception_iteration_ready = False
+        self._perception_error_sum.zero_()
+        self._perception_error_count.zero_()
+        if self._adaptive_schedule is not None:
+            self._adaptive_schedule.reset_phase()
         self._update_counter = 0.
         self._cur_noise_repeat_count.zero_()
         self._cur_noise_repeat_n.fill_(1)
@@ -492,25 +690,27 @@ class FlashSACVelFinetune(FlashSACVel):
             # Return the finished phase's cached blocks so the simulator (PhysX) can use them.
             torch.cuda.empty_cache()
 
-    def _start_warmup(self):
+    def _start_perception(self, *, student=None):
         self.stage = 1
-        self.warmup_iters_completed = 0
+        self._student_perception_phase = self.cycles_completed > 0 if student is None else student
+        self.perception_iters_completed = 0
         self._reset_phase_rollout()
         for online, ema in self._perception_pairs():
             online.requires_grad_(True).train()
             ema.requires_grad_(False).eval()
-        # perception_only_warmup reads self.stage, which is already 1 here.
-        self.actor_adapt.requires_grad_(not self.perception_only_warmup).train()
+        # is_repeated_perception_phase reads self.stage, which is already 1 here.
+        self.actor_adapt.requires_grad_(not self.is_repeated_perception_phase).train(
+            not self.is_repeated_perception_phase)
         for model in (self.critic, self.temperature):
             model.requires_grad_(False)
             model.zero_grad(set_to_none=True)
-        # Same as the original warmup: supervised optimizers start without Adam moments.
+        # Same as the original perception phase: supervised optimizers start without Adam moments.
         for optimizer in (self.opt_adapt, self.opt_adapt_actor):
             optimizer.state.clear()
-        kind = ("frozen-student-rollout perception-only" if self.perception_only_warmup
-                else "original teacher-rollout")
-        print(f"[FlashSAC finetune] Stage 1: restarting {kind} warmup "
-              f"after SAC cycle {self.cycles_completed}; replay released.")
+        kind = ("frozen-student-rollout perception-only" if self.is_repeated_perception_phase
+                else "teacher-rollout")
+        print(f"[FlashSAC finetune] Stage 1: restarting {kind} perception phase "
+              f"after SAC cycle {self.cycles_completed}; replay released ({self._last_transition_reason}).")
 
     def _update_once(self):
         batch = self.buffer.sample()
@@ -533,29 +733,52 @@ class FlashSACVelFinetune(FlashSACVel):
     def pop_info(self):
         info = super().pop_info()
         info.update({"finetune/stage": self.stage,
-                     "finetune/warmup_iters_completed": self.warmup_iters_completed,
+                     "finetune/perception_iters_completed": self.perception_iters_completed,
                      "finetune/rl_phase_iters_completed": self.rl_phase_iters_completed,
                      "finetune/cycles_completed": self.cycles_completed,
-                     "finetune/iters_completed": self.finetune_iters_completed})
-        info["actor/lr"] = (self.opt_adapt_actor if self.stage == 1 and not self.perception_only_warmup
-                            else self._student.optimizer).param_groups[0]["lr"]
+                     "finetune/iters_completed": self.finetune_iters_completed,
+                     "finetune/student_perception_phase": int(self.is_repeated_perception_phase)})
+        if self.cfg.cycle_mode:
+            info.update(self._last_schedule_info)
+            info["finetune/transition_reason"] = self._last_transition_reason
+            info["finetune/initial_reference_pending"] = int(self._initial_reference_pending)
+            if self._adaptive_schedule.reference_error is not None:
+                info["finetune/reference_error"] = self._adaptive_schedule.reference_error
+        if self._training_target_iter is not None:
+            info["finetune/final_sac_active"] = int(self._final_sac_active)
+            info["finetune/final_sac_iters_remaining"] = self._final_sac_iters_remaining()
+            info["finetune/extra_iters"] = max(0, self.finetune_iters_completed - self._training_target_iter)
+        optimizer = (self.opt_adapt_actor if self.stage == 1 and not self.is_repeated_perception_phase
+                     else self._student.optimizer if self._student is not None else None)
+        info["actor/lr"] = optimizer.param_groups[0]["lr"] if optimizer is not None else 0.
         return info
 
     def state_dict(self):
         state = super().state_dict()
-        state["finetune_version"] = 5
-        state["finetune_method"] = "cycles_v2"
+        state["finetune_version"] = 9
+        state["finetune_method"] = "adaptive_cycles_v2" if self.cfg.cycle_mode else "cycles_v2"
+        state["cycle_mode"] = self.cfg.cycle_mode
+        state["final_sac_iters"] = self.cfg.final_sac_iters
+        state["training_target_iter"] = self._training_target_iter
+        state["final_sac_active"] = self._final_sac_active
+        state["student_perception_phase"] = self._student_perception_phase
+        state["last_transition_reason"] = self._last_transition_reason
+        state.update({key: getattr(self.cfg, key) for key in _ADAPTIVE_SCHEDULE_FIELDS})
+        if self._adaptive_schedule is not None:
+            state["adaptive_schedule"] = self._adaptive_schedule.state_dict()
+            state["initial_reference_pending"] = self._initial_reference_pending
+            state["adaptive_lr_start_iter"] = self._adaptive_lr_start_iter
+            state["adaptive_lr_num_steps"] = self._adaptive_lr_num_steps
         state["finetune_stage"] = self.stage
-        state["warmup_iters_completed"] = self.warmup_iters_completed
+        state["perception_iters_completed"] = self.perception_iters_completed
         state["finetune_iters_completed"] = self.finetune_iters_completed
         state["student_replay_dim"] = self.student_replay_dim
         state["student_replay_index"] = self._student_replay_index.cpu()
-        state["perception_warmup_iters"] = self.cfg.perception_warmup_iters
-        state["rl_phase_iters"] = self.cfg.rl_phase_iters
+        state["perception_iters"] = self.cfg.perception_iters
+        state["sac_iters"] = self.cfg.sac_iters
         state["num_cycles"] = self.cfg.num_cycles
-        state["cycle_warmup_iters"] = self.cfg.cycle_warmup_iters
-        state["cycle_rl_phase_iters"] = self.cfg.cycle_rl_phase_iters
-        state["cycle_warmup_mode"] = self.cfg.cycle_warmup_mode
+        state["cycle_perception_iters"] = self.cfg.cycle_perception_iters
+        state["cycle_sac_iters"] = self.cfg.cycle_sac_iters
         state["rl_phase_iters_completed"] = self.rl_phase_iters_completed
         state["cycles_completed"] = self.cycles_completed
         for name in ("temporal_depth_gru", "temporal_depth_gru_ema"):
@@ -567,14 +790,17 @@ class FlashSACVelFinetune(FlashSACVel):
         return state
 
     def load_state_dict(self, state_dict, strict=True):
-        resume = state_dict.get("finetune_version") in (1, 5)
+        resume = state_dict.get("finetune_version") in (6, 7, 8, 9)
+        saved_adaptive = resume and state_dict.get("cycle_mode", False)
         if "finetune_version" in state_dict and not resume:
             raise ValueError("Unsupported finetune checkpoint version")
         if state_dict.get("actor_adapt_arch") != "flashsac_v1":
             raise ValueError("Finetune requires a teacher checkpoint with FlashSAC actor_adapt")
         if resume:
-            if state_dict.get("finetune_version") == 5 and state_dict.get("finetune_method") not in (
-                    "repeated_original_warmup_v1", "cycles_v2"):
+            adaptive_method = ("adaptive_cycles_v2" if state_dict["finetune_version"] >= 8
+                               else "adaptive_cycles_v1")
+            method = adaptive_method if saved_adaptive else "cycles_v2"
+            if state_dict.get("finetune_method") != method:
                 raise ValueError("Unsupported finetune method")
             if state_dict["finetune_stage"] not in (1, 2):
                 raise ValueError("Invalid finetune stage in checkpoint")
@@ -597,7 +823,14 @@ class FlashSACVelFinetune(FlashSACVel):
                 getattr(self, name).load_state_dict(state_dict[name], strict=strict)
             self.finetune_iters_completed = state_dict["finetune_iters_completed"]
             self.cycles_completed = state_dict.get("cycles_completed", 0)
-            # A repeated warmup also retains the preceding SAC optimizer/scheduler.
+            saved_student_phase = state_dict.get("student_perception_phase", self.cycles_completed > 0)
+            self._last_transition_reason = state_dict.get("last_transition_reason", "resume")
+            if self.cfg.cycle_mode and saved_adaptive:
+                # The invocation's frame budget may change on resume. Retain the
+                # original LR clock just as fixed mode retains its update budget.
+                self._adaptive_lr_start_iter = state_dict["adaptive_lr_start_iter"]
+                self._adaptive_lr_num_steps = state_dict["adaptive_lr_num_steps"]
+            # A repeated perception phase also retains the preceding SAC optimizer/scheduler.
             if "student_optimizer" in state_dict:
                 self._start_rl(schedule_updates=state_dict.get("rl_schedule_updates"))
                 self._student.optimizer.load_state_dict(state_dict["student_optimizer"])
@@ -606,15 +839,60 @@ class FlashSACVelFinetune(FlashSACVel):
                     network.optimizer.load_state_dict(state_dict[f"{name}_optimizer"])
                     network.scheduler.load_state_dict(state_dict[f"{name}_scheduler"])
                 self._update_step = state_dict["update_step"]
-                if state_dict["finetune_stage"] == 1:
-                    self._start_warmup()
-                    for name in ("opt_adapt", "opt_adapt_actor"):
-                        if name in state_dict:
-                            getattr(self, name).load_state_dict(state_dict[name])
-            self.warmup_iters_completed = state_dict["warmup_iters_completed"]
+            elif state_dict["finetune_stage"] == 2:
+                raise ValueError("SAC checkpoint is missing the student optimizer")
+            if state_dict["finetune_stage"] == 1:
+                # This also restores the initial student refresh, which has no
+                # SAC optimizer yet and cannot be inferred from cycles_completed.
+                self._start_perception(student=saved_student_phase)
+                for name in ("opt_adapt", "opt_adapt_actor"):
+                    if name in state_dict:
+                        getattr(self, name).load_state_dict(state_dict[name])
+            else:
+                self._student_perception_phase = saved_student_phase
+            self.perception_iters_completed = state_dict["perception_iters_completed"]
             self.rl_phase_iters_completed = state_dict.get("rl_phase_iters_completed", 0)
-        elif self.cfg.perception_warmup_iters == 0:
+            if self.cfg.cycle_mode:
+                if saved_adaptive:
+                    self._adaptive_schedule.load_state_dict(state_dict["adaptive_schedule"])
+                    # Version 8 can save SAC during replay filling, before the
+                    # initial reference exists. Version 7 always established it
+                    # in a separate refresh before starting SAC.
+                    self._initial_reference_pending = state_dict.get("initial_reference_pending", False)
+                    reference = self._adaptive_schedule.reference_error
+                    if not isinstance(self._initial_reference_pending, bool):
+                        raise ValueError("Invalid initial_reference_pending in checkpoint")
+                    if self._initial_reference_pending and reference is not None:
+                        raise ValueError("Pending initial reference is already set in checkpoint")
+                    if self.stage == 2 and reference is None and not self._initial_reference_pending:
+                        raise ValueError("Adaptive SAC checkpoint has no student reference error")
+                    if any(state_dict.get(key) != getattr(self.cfg, key) for key in _ADAPTIVE_SCHEDULE_FIELDS):
+                        # A new window/threshold must not inherit old patience decisions.
+                        self._adaptive_schedule.reset_phase()
+                    self._capture_schedule_info()
+                elif self.stage == 2:
+                    # A legacy SAC checkpoint establishes its first adaptive
+                    # reference while refilling replay, without an extra phase.
+                    self._initial_reference_pending = True
+                    self._last_transition_reason = "initialize_reference"
+        elif self.cfg.perception_iters == 0:
+            if self.cfg.cycle_mode:
+                self._last_transition_reason = "initial_sac"
             self._start_rl()
+        self._training_target_iter = None
+        self._final_sac_active = False
+        if (resume and saved_adaptive and self.cfg.cycle_mode and self.cfg.final_sac_iters > 0
+                and state_dict.get("finetune_version") == 9):
+            active = state_dict.get("final_sac_active", False)
+            if not isinstance(active, bool):
+                raise ValueError("Invalid final_sac_active in checkpoint")
+            if active:
+                target = state_dict.get("training_target_iter")
+                if (isinstance(target, bool) or not isinstance(target, Integral)
+                        or not 0 <= target <= self.finetune_iters_completed):
+                    raise ValueError("Invalid final SAC training target in checkpoint")
+                self._training_target_iter = int(target)
+                self._final_sac_active = True
         if self.reward_normalizer is not None:
             self.reward_normalizer.G_r.zero_()
         self._checkpoint_loaded = True
@@ -622,15 +900,17 @@ class FlashSACVelFinetune(FlashSACVel):
         # not checkpointed, and RL resumes by filling a fresh buffer with the warm-start actor.
         self.needs_env_reset = False
         self.env.set_progress(self.finetune_iters_completed)
+        cycle_progress = (f"adaptive refreshes={self.cycles_completed}" if self.cfg.cycle_mode
+                          else f"repeated cycles={self.cycles_completed}/{self.cfg.num_cycles}")
         print(f"[FlashSAC finetune] {'resumed' if resume else 'loaded teacher'}; "
-              f"stage={self.stage}, warmup={self.warmup_iters_completed}/{self._warmup_length()}, "
-              f"repeated cycles={self.cycles_completed}/{self.cfg.num_cycles}")
+              f"stage={self.stage}, perception phase={self.perception_iters_completed}/{self._perception_length()}, "
+              f"{cycle_progress}")
         return []
 
     def _warn_schedule_change(self, state):
         # The cycle schedule comes from the config, so it may change on resume (e.g. more cycles).
-        keys = ("perception_warmup_iters", "rl_phase_iters", "num_cycles",
-                "cycle_warmup_iters", "cycle_rl_phase_iters", "cycle_warmup_mode")
+        keys = ("cycle_mode", "final_sac_iters", "perception_iters", "sac_iters", "num_cycles",
+                "cycle_perception_iters", "cycle_sac_iters", *_ADAPTIVE_SCHEDULE_FIELDS)
         changed = [f"{k} {state[k]} -> {getattr(self.cfg, k)}" for k in keys
                    if k in state and state[k] != getattr(self.cfg, k)]
         if changed:

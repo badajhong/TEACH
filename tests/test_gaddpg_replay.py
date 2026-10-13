@@ -6,8 +6,8 @@ import unittest
 
 import torch
 
-from active_adaptation.learning.ppo.flashsac_vel_flat import NStepTrajectoryReplay
-from active_adaptation.learning.ppo.gaddpg_cosil_flashsac_vel_finetune import InterventionNStepReplay
+from active_adaptation.learning.flashsac.flashsac_vel_flat import NStepTrajectoryReplay
+from active_adaptation.learning.flashsac.gaddpg_cosil_flashsac_vel_finetune import InterventionNStepReplay
 
 GAMMA, N_STEP = 0.9, 3
 OPTIONS = dict(num_envs=2, obs_dim=2, action_dim=1, n_step=N_STEP, gamma=GAMMA, max_length=16,

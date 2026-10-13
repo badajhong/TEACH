@@ -14,7 +14,7 @@ import unittest
 import torch
 from torchrl.data import Composite, Unbounded
 
-from active_adaptation.learning.ppo.tgrl_flashsac_vel_finetune import (
+from active_adaptation.learning.flashsac.tgrl_flashsac_vel_finetune import (
     TGRLFlashSACVelFinetune, TGRLFlashSACVelFinetuneConfig,
 )
 
@@ -64,11 +64,11 @@ class TGRLCudaGraphsTest(unittest.TestCase):
             critic_state_encoder_dim=256, critic_action_encoder_dim=256, critic_num_bins=101,
             adapt_num_minibatches=2, buffer_max_length=128, buffer_min_length=16,
             sample_batch_size=self.batch_size, updates_per_interaction_step=1,
-            perception_warmup_iters=2, adapt_epochs=1,
+            perception_iters=2, adapt_epochs=1,
         )
         self.policy = TGRLFlashSACVelFinetune(
             cfg, self.spec, action_spec, None, self.device, env)
-        # Exercise the real warmup-to-RL transition without 500 simulator iterations.
+        # Exercise the real perception-to-SAC transition without 500 simulator iterations.
         self.policy._start_rl()
 
     def rl_batch(self):

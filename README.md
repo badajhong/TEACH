@@ -74,6 +74,13 @@ To export trained policies, add `export_policy=true` to the play script.
 
 Teacher policy with FlashSAC on the flat observation
 
+FlashSAC implementations, finetune variants, the adaptive schedule helper, and vendored
+upstream code live in `active_adaptation/learning/flashsac/`. PPO implementations remain
+in `active_adaptation/learning/ppo/`; FlashSAC imports shared observation/perception
+components from there. Algorithm names such as `algo=flashsac_vel_finetune` are unchanged.
+New configs use `active_adaptation.learning.flashsac.*` targets; old `learning.ppo.*`
+FlashSAC imports remain aliases for loading existing configs and checkpoints.
+
 `flashsac_vel_flat_train` trains the teacher with [FlashSAC](https://github.com/Holiday-Robot/FlashSAC) on the same task, rewards, observations and simulation as `ppo_vel_train`. The `flat` suffix indicates that its actor and critic share one flat observation vector.
 
 ```bash
@@ -83,7 +90,7 @@ python scripts/train.py algo=flashsac_vel_flat_train task=G1/vaic/skateboard_gen
 python scripts/play.py algo=flashsac_vel_flat_train task=G1/vaic/skateboard_general_tracking_tea vecnorm=null checkpoint_path=run:<wandb-run-path>
 ```
 
-- The FlashSAC networks and update rule are vendored unmodified in `active_adaptation/learning/ppo/flashsac_upstream/` (commit and per-file sha256 in `SOURCE.json`). Hyperparameters follow upstream `scripts/run_isaaclab.sh` (1024 envs, 2 updates per env step, batch 2048, 3-step returns) except where noted: here the actor is 256 wide (`algo.actor_hidden_dim`, upstream 128). Updates start after 100K transitions (`algo.buffer_min_length`).
+- The FlashSAC networks and update rule are vendored unmodified in `active_adaptation/learning/flashsac/flashsac_upstream/` (commit and per-file sha256 in `SOURCE.json`). Hyperparameters follow upstream `scripts/run_isaaclab.sh` (1024 envs, 2 updates per env step, batch 2048, 3-step returns) except where noted: here the actor is 256 wide (`algo.actor_hidden_dim`, upstream 128). Updates start after 100K transitions (`algo.buffer_min_length`).
 - The actor and the critic read the same observation, 1187 dims for the skateboard tasks: `command`, `policy`, `priv`, `object_`, `action_dr` and `ref_joint_pos_`, reduced as follows (the env still computes everything, so rewards and terminations are unchanged):
   - `algo.obs_keys` picks the groups. The object point cloud (`object_trans`, 384 dims) is left out; add `object_trans` to use it. `action_dr` is privileged: this episode's action delay (physics substeps) and low-pass filter alpha from `JointPosition`.
   - `algo.obs_drop_terms` removes single terms as `group/term`. By default it drops the noisy copies in `policy` of values `priv` holds without noise (`root_ang_vel_history`, `projected_gravity_history`, `joint_pos_history`, 180 dims), keeping `prev_actions`.
@@ -160,7 +167,7 @@ Use `algo.buffer_device_type=cuda` to keep it on the GPU instead.
 - Continue with `flashsac_vel_finetune` below to train depth perception and then freeze it
   for student SAC training.
 
-Two-stage FlashSAC student finetuning
+Adaptive FlashSAC student finetuning
 
 ```bash
 python scripts/train.py \
@@ -169,7 +176,7 @@ python scripts/train.py \
   checkpoint_path=/home/hcc/research/VAIC/outputs/2026-09-23/03-53-05-G1SkateboardGeneralTracking-flashsac_vel/wandb/latest-run/files/checkpoint_3000.pt
 ```
 
-Defaults: 512 camera environments, `vecnorm=null`, 32 steps per iteration, CPU replay.
+Defaults: 4096 camera environments, `vecnorm=null`, 32 steps per iteration, CPU replay.
 The student task enables cameras and retains its configured depth noise/delay. Teacher
 checkpoints must contain the FlashSAC `actor_adapt` (`actor_adapt_arch=flashsac_v1`).
 
@@ -183,32 +190,92 @@ explicitly with `app.enable_cameras=true` or `algo.enable_rtx=true`.
 
 Stage 1 action noise is controlled by `algo.teacher_perception_rollout_noise_scale=1.6`:
 `u = tanh(teacher_mean + teacher_std * noise * scale)`. Set it to `0.5` for half
-the pre-tanh noise amplitude or `0.0` for deterministic teacher actions. Repeated
-`perception_only` warmup sets roll out the frozen student with
+the pre-tanh noise amplitude or `0.0` for deterministic teacher actions.
+Student perception refreshes roll out the frozen student with
 `algo.student_perception_rollout_noise_scale=1.0` in the same formula. Stage 2 keeps
 its normal FlashSAC sampling (scale 1.0). The teacher's
 predicted std comes from the checkpoint, not directly from `temp_target_sigma`.
 
-1. For `algo.perception_warmup_iters` **new** iterations (default 500), the frozen teacher rolls out
-   with its normal FlashSAC exploration noise, including before any replay exists. Depth
+The default `algo.cycle_mode=true` uses measured EMA latent error to alternate perception
+and SAC, including the first SAC phase:
+
+1. For `algo.perception_iters` **new** iterations (default 500), the frozen teacher rolls out
+   with the configured exploration noise, including before any replay exists. Depth
    CNN/GRU, object estimator and adaptation GRU train from short contiguous rollouts using
    object MSE and privileged-latent MSE against the frozen teacher encoder. `actor_adapt`
    trains with action MSE using detached **predicted** latents from EMA perception and the
    teacher's deterministic action target. Teacher actor/encoder, critic/target critic and
    temperature stay fixed. No long-term replay is allocated in this stage.
-2. The depth/object/adaptation models and their EMA copies freeze. Environments and hidden
+2. Immediately after teacher perception, the depth/object/adaptation models and their EMA
+   copies freeze and the first SAC phase begins. Environments and hidden
    states reset at the boundary. The distilled `actor_adapt` becomes the SAC actor; teacher
    critic/target critic, temperature and reward-normalization statistics are retained.
    Fresh RL optimizers/schedules start; the warm-start actor fills an empty replay until
-   `buffer_min_length=100000`, then SAC updates begin. No uniform random warmup is used.
-   This first SAC phase lasts `algo.rl_phase_iters` (default 1000).
-3. Then `algo.num_cycles` repeated cycles (default 10; 0 = one-shot warmup) each run a
-   warmup set of `algo.cycle_warmup_iters` (default 300) and a SAC phase of
-   `algo.cycle_rl_phase_iters` (default 500); `num_cycles` does not count the first cycle.
-   With `algo.cycle_warmup_mode=perception_only` (default) the frozen student SAC actor rolls
-   out and only perception trains; `original` repeats the teacher warmup. Each set releases
-   the replay and resets environments; SAC optimizers and schedules continue. After the last
-   cycle, SAC runs to the end of training.
+   `buffer_min_length=2600000`, then SAC updates begin. No uniform random replay collection is used.
+   Just before SAC first becomes eligible to update, recent student replay-filling rollouts
+   establish the initial error reference. The current partial iteration is included if replay
+   becomes ready mid-iteration. This measurement adds no perception training or rollout delay.
+3. SAC and student perception refreshes alternate according to the measured error.
+   After a minimum SAC duration, sustained error growth triggers another student refresh.
+   The maximum SAC duration forces a refresh even without error growth. Each refresh releases
+   replay and resets environments; subsequent SAC phases retain their optimizers. Adaptive
+   cycles continue until the nominal training budget is exhausted, followed by
+   the optional final SAC completion rule below.
+   During refresh, the student actor is frozen and only perception trains. A refresh ends on
+   a plateau or its iteration cap, then replaces the reference with its recent observed EMA error.
+   Both the initial reference and refresh references are empirical errors, not minimum training loss.
+
+Adaptive settings (iteration counts include replay filling):
+
+| Setting | Default | Meaning |
+| --- | ---: | --- |
+| `perception_trigger` | `0.03` | Refresh when smoothed RMSE reaches `reference * 1.03` |
+| `perception_error_window` | `20` | Recent rollout iterations used for RMSE smoothing and the reference |
+| `perception_trigger_patience` | `3` | Consecutive eligible SAC iterations above the threshold |
+| `cycle_sac_iters_min` / `cycle_sac_iters_max` | `100` / `1000` | SAC cooldown and forced-refresh limit |
+| `plateau_window` | `60` | Compare the previous 60 and latest 60 refresh iterations |
+| `plateau_tol` | `0.0025` | Relative RMSE improvement below 0.25% counts as no improvement |
+| `plateau_check_interval` / `plateau_patience` | `10` / `3` | Check every 10 iterations; stop after 3 consecutive plateau checks |
+| `cycle_perception_iters_min` / `cycle_perception_iters_max` | `100` / `300` | Minimum refresh duration and safety cap |
+| `final_sac_iters` | `200` | Minimum uninterrupted SAC phase length at the end; `0` disables it; ignored when `cycle_mode=false` |
+
+`final_sac_iters` takes effect only when the nominal `total_frames` budget is reached,
+not that many iterations before the end. If already in SAC, the current phase counts
+toward the minimum: 80 completed iterations with `final_sac_iters=200` need another
+120, while 203 need none. If perception is still running, it finishes using the existing
+plateau/patience rules or its existing iteration cap, then SAC runs for the requested
+minimum. Initial teacher perception also finishes normally if the budget is unusually
+short. During this finishing period no new refresh starts, even if the error trigger or
+SAC cap fires on the exact budget boundary. Perception monitoring continues, and a SAC
+phase already in progress retains its replay and optimizers.
+
+This option can exceed `total_frames` by the remaining perception phase plus the missing
+SAC iterations. Counts include replay filling (about 20 iterations with the default
+buffer/environment settings), not only gradient updates. W&B `env_frames` records actual
+frames, including this extension. Learning rates retain their original clock and clamp
+to `learning_rate_end` once their schedule ends. Set `algo.final_sac_iters=0` to retain
+strict nominal-budget termination in adaptive mode; fixed mode always retains it.
+
+The error is `sqrt(sum of per-state latent MSE / valid state count)`, comparing rollout
+EMA predictions against the frozen teacher encoder, excluding `step_count <= 1`. Windows
+weight iterations by their valid state counts. This is a pre-update rollout measurement,
+separate from online `adapt/priv_loss`. Invalid measurements reset contiguous windows and
+patience. The initial reference may use fewer iterations when replay fills quickly; invalid
+measurements keep it pending and are retried without delaying SAC. Error triggers require a
+reference; the SAC duration cap still applies while it is pending. A cap can use a shorter
+valid refresh reference window; a refresh with no valid reference
+raises an error. Worsening RMSE also counts as no improvement for plateau detection.
+The 3% trigger and plateau defaults are pilot candidates from checkpoint probes and offline
+traces, not a guarantee of reward/success retention or a completed adaptive-training comparison.
+Smoothing, patience and duration limits still require validation during full training.
+
+`algo.sac_iters`, `algo.num_cycles`, `algo.cycle_perception_iters` and
+`algo.cycle_sac_iters` are ignored in adaptive mode. To retain the fixed schedule, set
+`algo.cycle_mode=false`: teacher perception is followed by `sac_iters=1000`, then
+`num_cycles=10` repeats of `cycle_perception_iters=300` and `cycle_sac_iters=500`, followed
+by SAC to the end. In fixed mode, `num_cycles=0` retains one-shot perception training.
+Adaptive learning rates decay with global environment-step progress after teacher perception,
+including refresh time; fixed mode retains its estimated SAC-update schedule.
 
 On this skateboard task the actor input is 525 dimensions (`vel_command` 20 + full `policy`
 249 + frozen latent 256). The replay observation is **1856** dimensions: existing teacher
@@ -227,20 +294,47 @@ Actions preserve the checkpoint's convention: by default
 positions for the final action even though they are outside the 525-dimensional actor input.
 Mean-action MSE does not supervise the stochastic std head; SAC trains it in Stage 2.
 
-W&B: `finetune/stage`, `finetune/warmup_iters_completed`, `finetune/iters_completed`,
+W&B: `finetune/stage`, `finetune/perception_iters_completed`, `finetune/iters_completed`,
 `finetune/cycles_completed`, `finetune/rl_phase_iters_completed`,
 `adapt/priv_loss`, `adapt/object_loss`, `adapt/adapt_loss`, `adapt/teacher_student_action_rmse`,
 latent/depth feature norms, and the existing FlashSAC actor/critic/temperature metrics.
+Adaptive mode also logs `finetune/perception_ema_rmse`, `finetune/perception_ema_rmse_smoothed`,
+`finetune/reference_error`, `finetune/relative_error`,
+`finetune/plateau_improvement`, trigger/plateau streaks and `finetune/transition_reason`.
+`finetune/initial_reference_pending` indicates whether the first student reference is still being collected.
+`finetune/final_sac_active` indicates that the nominal budget has been reached and the
+finishing rule is active; `finetune/final_sac_iters_remaining` reports the SAC iterations
+still required (the full requirement while perception is running), and
+`finetune/extra_iters` counts iterations beyond the nominal budget.
+`finetune/student_perception_phase` distinguishes teacher perception from student refreshes;
+`finetune/measurement_stage` and `finetune/measurement_student_rollout` identify the rollout
+that produced the error, including at phase boundaries.
 Evaluation uses the student path (EMA perception + actor_adapt), including Stage 1 checkpoints.
 
-Finetune checkpoints preserve the phase, counters, depth models, EMA and optimizer states.
-The cycle schedule comes from the current config, so a resume may change it (for example a
-larger `num_cycles` adds cycles; a warning lists the differences). Stage 2 resumes with frozen
-perception and refills replay (replay and simulator hidden states are not checkpointed).
-`total_frames` is the frame budget for the current invocation, including any remaining warmup.
-For a short smoke test set `algo.perception_warmup_iters=2 algo.rl_phase_iters=2
-algo.num_cycles=1 algo.cycle_warmup_iters=2 algo.cycle_rl_phase_iters=2` and smaller
-replay/batch/env counts.
+Version 9 finetune checkpoints preserve the phase, counters, depth models, EMA, optimizer
+states, adaptive reference, initial-reference pending status, measurement windows and patience counters. The original adaptive
+learning-rate clock and horizon are preserved on resume, even when the invocation frame budget
+changes. Schedule parameters come from the current config; changes are reported. Changing
+adaptive parameters clears the windows/patience but retains the reference. Versions 6, 7
+and 8 checkpoints remain supported. A fixed SAC checkpoint switching to adaptive mode
+collects its first reference while refilling replay; existing perception phases finish normally.
+An older version 7 checkpoint saved during its initial student refresh retains that phase on resume.
+Stage 2 resumes with frozen perception and
+refills replay (replay and simulator hidden states are not checkpointed).
+`total_frames` is normally the nominal frame budget for the current invocation, including
+any remaining perception training. A checkpoint already in the final completion period
+retains that original budget boundary and resumes its unfinished tail, rather than
+starting a new full budget. The current config's `final_sac_iters` applies on resume;
+a completed tail needs no more iterations unless that requirement is increased.
+Disabling the option or switching to fixed mode restores ordinary invocation-budget behavior.
+For a short adaptive smoke test set `algo.perception_iters=2
+algo.cycle_perception_iters_min=2 algo.cycle_perception_iters_max=4
+algo.cycle_sac_iters_min=2 algo.cycle_sac_iters_max=4 algo.perception_error_window=2
+algo.plateau_window=2 algo.plateau_check_interval=1 algo.final_sac_iters=0` and smaller replay/batch/env counts.
+For the equivalent fixed-schedule test, set `algo.cycle_mode=false algo.perception_iters=2
+algo.sac_iters=2 algo.num_cycles=1 algo.cycle_perception_iters=2 algo.cycle_sac_iters=2`.
+The self-contained CoSIL, TGRL and GADDPG variants below retain their fixed schedules;
+these new adaptive settings apply to `flashsac_vel_finetune`.
 
 CoSIL variant (`algo=cosil_flashsac_vel_finetune`, self-contained copy of this flow). It follows
 CoSIL (Nguyen et al., CoRL 2022) and regularizes the student SAC actor toward the frozen teacher

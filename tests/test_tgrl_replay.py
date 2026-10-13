@@ -6,7 +6,7 @@ import unittest
 
 import torch
 
-from active_adaptation.learning.ppo.flashsac_vel_flat import NStepTrajectoryReplay
+from active_adaptation.learning.flashsac.flashsac_vel_flat import NStepTrajectoryReplay
 
 
 class TGRLReplayTest(unittest.TestCase):

@@ -11,13 +11,14 @@ import torch
 from tensordict import TensorDict
 from torchrl.data import Composite, Unbounded
 
-from active_adaptation.learning.ppo.flashsac_vel import FlashSACVel, FlashSACVelConfig
-from active_adaptation.learning.ppo.flashsac_vel_finetune import (
+from active_adaptation.learning.flashsac.flashsac_vel import FlashSACVel, FlashSACVelConfig
+from active_adaptation.learning.flashsac.flashsac_vel_finetune import (
     FlashSACVelFinetune, FlashSACVelFinetuneConfig,
 )
 
 
 class FinetuneTest(unittest.TestCase):
+    checkpoint_version = 9
     def setUp(self):
         self.old_threads = torch.get_num_threads()
         torch.set_num_threads(1)
@@ -61,7 +62,7 @@ class FinetuneTest(unittest.TestCase):
         torch.set_num_threads(self.old_threads)
 
     def new_policy(self):
-        cfg = FlashSACVelFinetuneConfig(**self.options, perception_warmup_iters=2, adapt_epochs=1)
+        cfg = FlashSACVelFinetuneConfig(**self.options, cycle_mode=False, perception_iters=2, adapt_epochs=1)
         return FlashSACVelFinetune(cfg, self.spec, self.action_spec, None, "cpu", self.env)
 
     def observation(self):
@@ -72,7 +73,7 @@ class FinetuneTest(unittest.TestCase):
         td["step_count"] = torch.ones(4, 1, dtype=torch.long) * 3
         return td
 
-    def warmup_iteration(self):
+    def perception_iteration(self):
         p = self.policy
         rollout = p.get_rollout_policy("train")
         for _ in range(p.cfg.train_every):
@@ -84,12 +85,12 @@ class FinetuneTest(unittest.TestCase):
         for key, value in model.state_dict().items():
             self.assertTrue(torch.equal(value, state[key]), key)
 
-    def test_warmup_updates_only_students_then_freezes(self):
+    def test_perception_updates_only_students_then_freezes(self):
         p = self.policy
         self.assertFalse(p._critic.optimizer.state)
         student_before = copy.deepcopy(p.actor_adapt.state_dict())
         perception_before = [x.detach().clone() for x in p._perception_parameters()]
-        self.warmup_iteration()
+        self.perception_iteration()
         self.assertEqual(p.stage, 1)
         self.assertIsNone(p.buffer)
         self.assert_model_equal(p.actor, self.teacher_state["actor"])
@@ -103,8 +104,8 @@ class FinetuneTest(unittest.TestCase):
         mid = copy.deepcopy(p.state_dict())
         self.policy = self.new_policy()
         self.policy.load_state_dict(mid)
-        self.assertEqual(self.policy.warmup_iters_completed, 1)
-        self.warmup_iteration()
+        self.assertEqual(self.policy.perception_iters_completed, 1)
+        self.perception_iteration()
         p = self.policy
         self.assertEqual(p.stage, 2)
         self.assertTrue(p.needs_env_reset)
@@ -116,10 +117,43 @@ class FinetuneTest(unittest.TestCase):
         self.assert_model_equal(p.actor, self.teacher_state["actor"])
         self.assert_model_equal(p.critic, self.teacher_state["critic"])
 
+    def test_repeated_perception_freezes_actor_and_resumes_counter(self):
+        p = self.policy
+        self.perception_iteration()
+        self.perception_iteration()
+        p.cycles_completed = 1
+        p.cfg.cycle_perception_iters = 2
+        p._start_perception()
+        self.assertTrue(p.is_repeated_perception_phase)
+        self.assertTrue(all(not x.requires_grad for x in p.actor_adapt.parameters()))
+        actor_before = copy.deepcopy(p.actor_adapt.state_dict())
+        perception_before = [x.detach().clone() for x in p._perception_parameters()]
+        self.perception_iteration()
+        self.assert_model_equal(p.actor_adapt, actor_before)
+        self.assertTrue(any(not torch.equal(a, b)
+                            for a, b in zip(p._perception_parameters(), perception_before)))
+        saved = copy.deepcopy(p.state_dict())
+        self.assertEqual(saved["finetune_version"], self.checkpoint_version)
+        self.policy = self.new_policy()
+        self.policy.cfg.cycle_perception_iters = 2
+        self.policy.load_state_dict(saved)
+        self.assertEqual(self.policy.perception_iters_completed, 1)
+        self.assertTrue(self.policy.is_repeated_perception_phase)
+        self.assertTrue(all(not x.requires_grad for x in self.policy.actor_adapt.parameters()))
+        self.perception_iteration()
+        self.assertEqual(self.policy.stage, 2)
+        self.assertTrue(all(x.requires_grad for x in self.policy.actor_adapt.parameters()))
+
+    def test_old_finetune_checkpoint_is_rejected(self):
+        saved = self.policy.state_dict()
+        saved["finetune_version"] = 5
+        with self.assertRaisesRegex(ValueError, "Unsupported finetune checkpoint version"):
+            self.policy.load_state_dict(saved)
+
     def test_frozen_replay_terminal_latent_and_resume(self):
         p = self.policy
-        self.warmup_iteration()
-        self.warmup_iteration()
+        self.perception_iteration()
+        self.perception_iteration()
         p.needs_env_reset = False
         frozen = [x.detach().clone() for x in p._perception_parameters()]
         rollout = p.get_rollout_policy("train")

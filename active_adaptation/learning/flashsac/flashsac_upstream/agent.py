@@ -22,7 +22,7 @@ from .update import (
 )
 from .utils_network import Network
 from .reward_normalization import RewardNormalizer
-from .scheduler import warmup_cosine_decay_scheduler
+from .scheduler import ramp_cosine_decay_scheduler
 from .torch_buffer import TorchUniformBuffer
 from ._types import NDArray, Tensor
 
@@ -44,8 +44,8 @@ class FlashSACConfig:
     learning_rate_init: float
     learning_rate_peak: float
     learning_rate_end: float
-    learning_rate_warmup_rate: float
-    learning_rate_warmup_step: int
+    learning_rate_ramp_rate: float
+    learning_rate_ramp_step: int
     learning_rate_decay_rate: float
     learning_rate_decay_step: int
 
@@ -86,11 +86,11 @@ def _init_flashsac_networks(
     device: torch.device,
 ) -> tuple[Network, Network, Network, Network]:
     # Create learning rate schedule
-    warmup_cosine_decay_lr = warmup_cosine_decay_scheduler(
+    warmup_cosine_decay_lr = ramp_cosine_decay_scheduler(
         init_value=cfg.learning_rate_init,
         peak_value=cfg.learning_rate_peak,
         end_value=cfg.learning_rate_end,
-        warmup_steps=cfg.learning_rate_warmup_step,
+        ramp_steps=cfg.learning_rate_ramp_step,
         decay_steps=cfg.learning_rate_decay_step,
     )
 

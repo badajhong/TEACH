@@ -47,9 +47,21 @@ def train_off_policy(cfg, env, policy, run, episode_stats, save, should_save):
     end_keys = [("stats", "episode_time_limit"), ("stats", "command_finished")]
     episode_stats = EpisodeStats(list(episode_stats.in_keys) + end_keys, device=env.device)
 
+    # Most off-policy agents run exactly the invocation's frame budget. A staged
+    # agent can finish its current phase and a final SAC tail after that budget.
+    configure_budget = getattr(policy, "configure_training_budget", None)
+    if configure_budget is not None:
+        configure_budget(total_iters)
+
+    def iteration_indices():
+        i = 0
+        while not (policy.training_complete() if configure_budget is not None else i >= total_iters):
+            yield i
+            i += 1
+
     carry = env.reset()
     rollout_policy = policy.get_rollout_policy("train")
-    progress = tqdm(range(total_iters)) if aa.is_main_process() else range(total_iters)
+    progress = tqdm(iteration_indices(), total=total_iters) if aa.is_main_process() else iteration_indices()
     env_frames = 0
     start_iter = env.current_iter
     for i in progress:
