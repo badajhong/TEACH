@@ -46,6 +46,8 @@ ConfigStore.instance().store(
 
 
 class JointFlashSACVelFinetune(FlashSACVelFinetune):
+    reuse_rollout_predictions = True
+
     def __init__(self, cfg, observation_spec, action_spec, reward_spec, device, env):
         # Reuse the one-shot teacher/student setup internally. Cycle controls are
         # not part of the public Hydra config and cannot turn joint training off.

@@ -1,0 +1,1161 @@
+"""DAgger-style teacher intervention, CoSIL and joint perception/SAC training.
+
+This module owns its rollout, intervention replay, perception updates, CoSIL losses
+and checkpoint handling. It depends on the generic FlashSAC teacher implementation,
+not on another finetune algorithm. An optional one-shot teacher warmup precedes
+joint training; there are no refresh cycles. SAC stores collected latents rather
+than depth in long replay, and its gradients do not flow into perception.
+
+D = sum((teacher_mean_action - student_mean_action)**2), in normalized action space.
+Actor loss: beta * D - min(Q), plus alpha * log_pi in cosil_entropy mode.
+The critic bootstraps the student value minus the same CoSIL/entropy penalty.
+Beta increases when divergence exceeds target_divergence. Online teacher takeovers
+apply only in mixed envs; evaluation and train/* metrics use the pure student.
+"""
+
+import contextlib
+import copy
+import math
+from dataclasses import dataclass
+from numbers import Integral
+from typing import List
+
+import torch
+from torch import nn, optim
+from hydra.core.config_store import ConfigStore
+from tensordict import TensorDict
+from tensordict.nn import TensorDictModuleBase, TensorDictSequential as Seq
+from torchrl.data import Unbounded
+from torchrl.envs.transforms import TensorDictPrimer
+
+from ..ppo.common import ACTION_KEY, OBS_KEY, CatTensors, make_batch, make_conv
+from .flashsac_vel import FlashSACVel, FlashSACVelConfig
+from .flashsac_vel_flat import ACTION_DR_KEY, U_KEY, FlashSACVelFlat
+from .flashsac_upstream.agent import _sample_flashsac_actions, _update_networks
+from .flashsac_upstream.distribution import safe_tanh_log_det_jacobian
+from .flashsac_upstream.network import FlashSACTemperature
+from .flashsac_upstream.update import (
+    _compute_categorical_td_target, _select_min_q_log_probs, update_target_network, update_temperature,
+)
+from .flashsac_upstream.scheduler import ramp_cosine_decay_scheduler
+from .flashsac_upstream.utils_network import Network
+from ..ppo.ppo_vel import (
+    DEPTH_KEY, VEL_CMD_KEY, OBJECT_KEY, OBJECT_PRED_KEY, OBJECT_PRED_TRANS_KEY,
+    PRIV_FEATURE_KEY, PRIV_PRED_KEY, REF_JPOS_KEY, TemporalDepthGRU,
+)
+from ..modules.rnn import set_recurrent_mode
+
+
+@dataclass
+class DAggerCoSILJointFlashSACVelFinetuneConfig(FlashSACVelConfig):
+    _target_: str = (
+        "active_adaptation.learning.flashsac.dagger_cosil_joint_flashsac_vel_finetune."
+        "DAggerCoSILJointFlashSACVelFinetune"
+    )
+    name: str = "dagger_cosil_joint_flashsac_vel_finetune"
+    num_envs: int = 4096
+    enable_rtx: bool = False
+    updates_per_interaction_step: float = 8.0
+    # Optional teacher-rollout warmup; zero starts joint learning immediately.
+    perception_iters: int = 0
+    teacher_perception_rollout_noise_scale: float = 1.6
+    adapt_epochs: int = 2
+    perception_ema_tau: float = 0.08
+    in_keys: List[str] = (*FlashSACVelConfig.in_keys, DEPTH_KEY)
+    learning_rate_end: float = 1e-5
+    buffer_max_length: int = 10_000_000
+    buffer_min_length: int = 2_600_000
+    buffer_device_type: str = "cpu"
+    # "cosil": divergence penalty; "cosil_entropy": also retain SAC entropy;
+    # "entropy": plain SAC loss, with teacher intervention still available.
+    cosil_mode: str = "cosil_entropy"
+    target_divergence: float = 0.8
+    beta_init: float = 0.01
+    intervention_env_fraction: float = 0.5
+    intervention_rate_init: float = 0.6
+    intervention_rate_end: float = 0.0
+    intervention_decay_fraction: float = 0.5
+    intervention_hold_steps: int = 10
+    intervention_tau_init: float = 0.5
+    intervention_tau_lr: float = 1.0
+
+
+ConfigStore.instance().store(
+    "dagger_cosil_joint_flashsac_vel_finetune",
+    node=DAggerCoSILJointFlashSACVelFinetuneConfig, group="algo",
+)
+
+
+INTERVENED_KEY = "dagger_intervened"
+_TEACHER_FEATURE = "_dagger_teacher_feature"
+_TEACHER_ACTION = "_dagger_teacher_mean_action"
+
+# Sampling from RAM runs right after the updates wait on the GPU, when the intra-op thread pool
+# has gone idle; waking all cores then costs ~6 ms per op on this machine, a few threads ~0.7 ms.
+_CPU_SAMPLE_THREADS = 4
+
+
+@contextlib.contextmanager
+def _cpu_threads(num_threads: int):
+    previous = torch.get_num_threads()
+    torch.set_num_threads(num_threads)
+    try:
+        yield
+    finally:
+        torch.set_num_threads(previous)
+
+
+def _check_ram(nbytes: int, rows: int, reserve: int = 4 * 2**30):
+    """Fail before allocating a CPU replay that would push the machine out of memory."""
+    try:
+        with open("/proc/meminfo") as f:
+            available = next(int(line.split()[1]) * 1024 for line in f if line.startswith("MemAvailable:"))
+    except (OSError, StopIteration):
+        return
+    if nbytes > available - reserve:
+        fit = int(rows * (available - reserve) / nbytes)
+        raise MemoryError(
+            f"the CPU replay needs {nbytes / 2**30:.1f} GiB but {available / 2**30:.1f} GiB of RAM is available "
+            f"(keeping {reserve / 2**30:.0f} GiB free); set algo.buffer_max_length to about {fit} or less"
+        )
+
+
+class InterventionNStepReplay:
+    """flashsac_vel_flat.NStepTrajectoryReplay plus a per-row teacher-intervention flag.
+
+    Rows are drawn uniformly with replacement. The n-step return stops at the first
+    episode end and, unless bootstrap is cut, uses that step's next observation with
+    the discount for the actual number of rewards collected. Each observation is stored
+    once, in per-env time order, so the next observation of row t is the one in slot t+1.
+
+    VAIC does not recompute observations on reset, so on the step after a reset the env
+    carries a placeholder observation. That slot is filled with the true final observation
+    of the finished episode instead, and the row itself is never sampled.
+
+    The window of row t also stops before the first step t+k (k >= 1) whose action was the
+    teacher's and bootstraps from s_{t+k}. The critic target always multiplies by gamma^n,
+    so for a window shortened to m rewards, `1 - terminated` encodes gamma^(m - n) times
+    the product of the env discounts. `terminated` may therefore be negative. A terminal
+    cut still sets it to 1, disabling bootstrap.
+
+    Observations may be stored in a lower precision (`obs_dtype`); sampled batches are float32.
+    With `storage_device="cpu"` the data lives in RAM and each batch is gathered into pinned
+    memory and copied to `device` asynchronously.
+    """
+
+    def __init__(
+        self, num_envs, obs_dim, action_dim, n_step, gamma, max_length, min_length, batch_size, device,
+        obs_dtype=torch.float32, storage_device=None,
+    ):
+        self.num_envs = num_envs
+        self.n_step = n_step
+        self.gamma = gamma
+        self.min_length = min_length
+        self.batch_size = batch_size
+        self.device = torch.device(device)  # where sampled batches are used
+        self.storage = torch.device(storage_device) if storage_device is not None else self.device
+        self.T = max(max_length // num_envs, n_step + 2)
+        shape = (self.T, num_envs)
+        if self.storage.type == "cpu":
+            row_bytes = obs_dim * torch.finfo(obs_dtype).bits // 8 + action_dim * 4 + 16
+            _check_ram(self.T * num_envs * row_bytes, num_envs * self.T)
+        with torch.device(self.storage):
+            self.obs = torch.zeros(*shape, obs_dim, dtype=obs_dtype)
+            self.action = torch.zeros(*shape, action_dim)
+            self.reward = torch.zeros(shape)
+            self.discount = torch.ones(shape)
+            self.done = torch.zeros(shape, dtype=torch.bool)
+            self.cut = torch.zeros(shape, dtype=torch.bool)  # no bootstrap past this row
+            self.valid = torch.zeros(shape, dtype=torch.bool)  # the row may start a transition
+            self.intervened = torch.zeros(shape, dtype=torch.bool)  # the row's action was the teacher's
+            self.weight = torch.zeros(shape)  # 1 where the row can be sampled right now
+        self.step = 0  # global index of the next row
+        if self.storage.type == "cpu" and self.device.type == "cuda":
+            # reused pinned staging buffers and a separate stream, so copies do not queue behind the
+            # training kernels and each batch lands in memory that is already mapped
+            self._copy_stream = torch.cuda.Stream(self.device)
+            self._staging = [
+                (torch.empty(2 * batch_size, obs_dim, dtype=obs_dtype, pin_memory=True),
+                 torch.empty(batch_size, action_dim + 2, pin_memory=True),
+                 torch.cuda.Event())
+                for _ in range(4)
+            ]
+            self._staging_index = 0
+
+    @property
+    def capacity(self) -> int:
+        return self.T * self.num_envs
+
+    def nbytes(self) -> int:
+        tensors = (self.obs, self.action, self.reward, self.discount, self.done, self.cut, self.valid,
+                   self.intervened, self.weight)
+        return sum(t.numel() * t.element_size() for t in tensors)
+
+    def __len__(self) -> int:
+        """Rows whose n-step window is complete, like upstream's count of emitted transitions."""
+        ready_steps = min(self.step + 1 - self.n_step, self.T - self.n_step)
+        return max(ready_steps, 0) * self.num_envs
+
+    def can_sample(self) -> bool:
+        return len(self) >= self.min_length
+
+    def add(self, obs, next_obs, action, reward, discount, done, cut, valid, intervened):
+        g, T = self.step, self.T
+        s = g % T
+        next_obs = next_obs.to(self.obs.dtype)  # cast before a possible copy to RAM
+        if g == 0:
+            self.obs[s] = obs.to(self.obs.dtype)
+        self.action[s] = action
+        self.reward[s] = reward
+        self.discount[s] = discount
+        self.done[s] = done
+        self.cut[s] = cut
+        self.valid[s] = valid
+        self.intervened[s] = intervened
+        self.weight[s] = 0.0
+        # the next slot's previous occupant loses its observation
+        self.obs[(g + 1) % T] = next_obs
+        self.weight[(g + 1) % T] = 0.0
+        j = g + 1 - self.n_step  # row whose window just became complete
+        if j >= 0:
+            self.weight[j % T] = self.valid[j % T].float()
+        self.step += 1
+
+    def sample(self):
+        N = self.num_envs
+        if self.storage.type != "cpu":
+            # uniform with replacement over sampleable rows; much faster than torch.multinomial at this size
+            cdf = torch.cumsum(self.weight.view(-1), 0)
+            u = torch.rand(self.batch_size, device=cdf.device) * cdf[-1]
+            idx = torch.searchsorted(cdf, u, right=True)
+            return self.gather(idx // N, idx % N)
+        # in RAM: the same rows (valid starts in the ready window), drawn by rejection, which is
+        # cheaper on the CPU than a cumulative sum over every row
+        with _cpu_threads(_CPU_SAMPLE_THREADS):
+            last = self.step - 1
+            first = max(0, last - self.T + 2)  # oldest row whose observation is still stored
+            count = (last + 1 - self.n_step - first + 1) * N  # up to the newest row with a complete window
+            idx = torch.randint(count, (self.batch_size,))
+            t, env = (first + idx // N) % self.T, idx % N
+            redo = ~self.valid[t, env]
+            while redo.any():
+                idx = torch.randint(count, (int(redo.sum()),))
+                t[redo], env[redo] = (first + idx // N) % self.T, idx % N
+                redo = ~self.valid[t, env]
+            return self.gather(t, env)
+
+    def gather(self, t: torch.Tensor, env: torch.Tensor):
+        T, N, B = self.T, self.num_envs, t.shape[0]
+        n_step_reward = torch.zeros(t.shape, device=t.device)
+        scale = torch.ones_like(n_step_reward)  # product of the env's soft discounts so far
+        cont = torch.ones_like(n_step_reward)
+        alive = torch.ones_like(t, dtype=torch.bool)
+        next_t = (t + self.n_step) % T
+        for k in range(self.n_step):
+            tk = (t + k) % T
+            if k > 0:
+                # stop before a teacher action and bootstrap from s_{t+k} with gamma^k
+                stop = alive & self.intervened[tk, env]
+                next_t = torch.where(stop, tk, next_t)
+                cont = torch.where(stop, scale * self.gamma ** (k - self.n_step), cont)
+                alive = alive & ~stop
+            done = self.done[tk, env]
+            n_step_reward += alive * (self.gamma**k) * scale * self.reward[tk, env]
+            scale = torch.where(alive, scale * self.discount[tk, env], scale)
+            ends = alive & done
+            next_t = torch.where(ends, (tk + 1) % T, next_t)
+            # This end follows k+1 rewards. Compensate for the critic's fixed
+            # gamma^n so truncations bootstrap with gamma^(k+1), not gamma^n.
+            end_cont = scale * ~self.cut[tk, env] * self.gamma ** (k + 1 - self.n_step)
+            cont = torch.where(ends, end_cont, cont)
+            alive = alive & ~done
+        cont = torch.where(alive, scale, cont)
+
+        rows = torch.cat([t * N + env, next_t * N + env])
+        obs_rows = self.obs.view(-1, self.obs.shape[-1])
+        # upstream's critic target multiplies the bootstrap by (1 - terminated)
+        parts = [self.action.view(T * N, -1).index_select(0, rows[:B]), n_step_reward[:, None], 1.0 - cont[:, None]]
+        if self.storage == self.device:
+            obs, rest = obs_rows.index_select(0, rows), torch.cat(parts, dim=1)
+        elif hasattr(self, "_staging") and B == self.batch_size:
+            obs, rest = self._to_device(obs_rows, rows, parts)
+        else:  # batches of other sizes (tests) take the plain path
+            obs, rest = obs_rows.index_select(0, rows).to(self.device), torch.cat(parts, dim=1).to(self.device)
+        obs = obs.float()
+        A = self.action.shape[-1]
+        return {
+            "observation": obs[:B],
+            "action": rest[:, :A].contiguous(),
+            "reward": rest[:, A].contiguous(),
+            "terminated": rest[:, A + 1].contiguous(),
+            "next_observation": obs[B:],
+        }
+
+    def _to_device(self, obs_rows, rows, parts):
+        obs_pinned, rest_pinned, copied = self._staging[self._staging_index]
+        self._staging_index = (self._staging_index + 1) % len(self._staging)
+        copied.synchronize()  # the copy that last read this staging slot is done (normally long ago)
+        torch.index_select(obs_rows, 0, rows, out=obs_pinned)
+        torch.cat(parts, dim=1, out=rest_pinned)
+        with torch.cuda.stream(self._copy_stream):
+            obs = obs_pinned.to(self.device, non_blocking=True)
+            rest = rest_pinned.to(self.device, non_blocking=True)
+            copied.record(self._copy_stream)
+        stream = torch.cuda.current_stream(self.device)
+        stream.wait_event(copied)
+        obs.record_stream(stream)
+        rest.record_stream(stream)
+        return obs, rest
+
+
+class DAggerJointRollout(TensorDictModuleBase):
+    def __init__(self, policy, mode):
+        super().__init__()
+        object.__setattr__(self, "policy", policy)
+        self.train_mode = mode == "train"
+        self.in_keys = list(dict.fromkeys([
+            *policy.replay_env_keys, VEL_CMD_KEY, DEPTH_KEY,
+            "is_init", "adapt_hx", "depth_hx",
+        ]))
+        self.out_keys = [ACTION_KEY, U_KEY, PRIV_PRED_KEY,
+                         ("next", "adapt_hx"), ("next", "depth_hx")]
+
+    @torch.no_grad()
+    def forward(self, td):
+        p = self.policy
+        if not p._checkpoint_loaded:
+            raise RuntimeError(f"{p.cfg.name} requires checkpoint_path to a teacher or finetune checkpoint")
+        if ACTION_DR_KEY in p.replay_keys:
+            td[ACTION_DR_KEY] = p.action_dr()
+        p._perceive(td, ema=True)
+        teacher_rollout = self.train_mode and p.stage == 1
+        if teacher_rollout:
+            network, observation = p._actor, p.replay_obs(td)
+        else:
+            network = p._student if p._student is not None else p._student_rollout
+            observation = p._actor_adapt_input(td)
+        if self.train_mode:
+            # Even with an empty replay, sample the warm-start policy (never uniform actions).
+            reuse_mean = p.reuse_rollout_predictions and p.stage == 2
+            sampled = (
+                _sample_flashsac_actions(
+                    actor=network, noise=p._cached_noise, observations=observation,
+                    temperature=p._rollout_noise_scale(teacher_rollout),
+                    cur_count=p._cur_noise_repeat_count,
+                    cur_n=p._cur_noise_repeat_n, zeta_cdf=p._zeta_cdf,
+                    return_mean_action=reuse_mean,
+                )
+            )
+            p._cached_noise, u, p._cur_noise_repeat_count, p._cur_noise_repeat_n = sampled[:4]
+            if p.stage == 2:
+                u = p._intervene(td, observation, u,
+                                 student_mean_action=sampled[4] if reuse_mean else None)
+        else:
+            mean, _ = network.apply("get_mean_and_std", observation, training=False)
+            u = torch.tanh(mean)
+        td[U_KEY] = u
+        td[ACTION_KEY] = p._joint_action(u, td)
+        return td
+
+
+class DAggerCoSILJointFlashSACVelFinetune(FlashSACVel):
+    intervention_prefix = "dagger"
+    intervention_label = "DAgger-style intervention"
+    intervened_key = INTERVENED_KEY
+    reuse_rollout_predictions = True
+
+    def __init__(self, cfg, observation_spec, action_spec, reward_spec, device, env):
+        if cfg.perception_iters < 0 or cfg.adapt_epochs < 1:
+            raise ValueError("perception_iters must be >= 0 and adapt_epochs >= 1")
+        if cfg.cosil_mode not in ("cosil", "cosil_entropy", "entropy"):
+            raise ValueError("cosil_mode must be 'cosil', 'cosil_entropy' or 'entropy'")
+        if cfg.target_divergence < 0 or not cfg.beta_init > 0:
+            raise ValueError("target_divergence must be >= 0 and beta_init > 0")
+        if not 0 < cfg.intervention_env_fraction <= 1:
+            raise ValueError("intervention_env_fraction must be in (0, 1]")
+        for name in ("intervention_rate_init", "intervention_rate_end"):
+            if not 0 <= getattr(cfg, name) < 1:
+                raise ValueError(f"{name} must be in [0, 1)")
+        if not 0 <= cfg.intervention_decay_fraction <= 1 or cfg.intervention_hold_steps < 1:
+            raise ValueError("intervention_decay_fraction must be in [0, 1] and intervention_hold_steps >= 1")
+        if not cfg.intervention_tau_init > 0 or cfg.intervention_tau_lr < 0:
+            raise ValueError("intervention_tau_init must be > 0 and intervention_tau_lr >= 0")
+        if not 0 <= cfg.teacher_perception_rollout_noise_scale < float("inf"):
+            raise ValueError("teacher_perception_rollout_noise_scale must be finite and >= 0")
+        if not 0 < cfg.perception_ema_tau <= 1:
+            raise ValueError("perception_ema_tau must be in (0, 1]")
+        if cfg.adapt_module != "gru" or not cfg.use_object_adapt:
+            raise ValueError(f"{cfg.name} requires GRU and object adaptation")
+        if not cfg.enable_residual_distillation:
+            raise ValueError("Stage 1 requires enable_residual_distillation=true")
+        if observation_spec.get(DEPTH_KEY, None) is None:
+            raise ValueError("Student finetune requires depth observations and enabled cameras")
+        super().__init__(cfg, observation_spec, action_spec, reward_spec, device, env)
+        if self.num_envs < cfg.adapt_num_minibatches or self.num_envs % cfg.adapt_num_minibatches:
+            raise ValueError("num_envs must be divisible by adapt_num_minibatches")
+        self.stage = 1
+        self.perception_iters_completed = 0
+        self.rl_phase_iters_completed = 0
+        self.joint_perception_iters_completed = 0
+        self.finetune_iters_completed = 0
+        self._rl_steps_in_iteration = 0
+        self._checkpoint_loaded = False
+        self.needs_env_reset = False
+        self._student = None
+        self._beta = None
+        self._student_rollout = Network(self.actor_adapt)
+        self._adapt_buffer, self._adapt_t = None, 0
+        self.actor.requires_grad_(False).eval()
+        self.critic.requires_grad_(False)
+        self.temperature.requires_grad_(False)
+        self.vel_command_dim = observation_spec[VEL_CMD_KEY].shape[-1]
+        self.student_replay_dim = self.replay_obs_dim + self.vel_command_dim + cfg.latent_dim
+        layout = {k: (s, e) for k, s, e, _ in self.replay_layout}
+        policy_start, policy_end = layout[OBS_KEY]
+        self._student_replay_index = torch.tensor([
+            *range(self.replay_obs_dim, self.replay_obs_dim + self.vel_command_dim),
+            *range(policy_start, policy_end),
+            *range(self.replay_obs_dim + self.vel_command_dim, self.student_replay_dim),
+        ], device=self.device)
+        self._print_training_schedule()
+        if cfg.cosil_mode == "entropy":
+            print("[CoSIL] mode entropy: no CoSIL term, FlashSAC's own update.")
+        else:
+            print(f"[CoSIL] mode {cfg.cosil_mode}, target_divergence {cfg.target_divergence}, "
+                  f"beta_init {cfg.beta_init}.")
+        # Mixed envs spread evenly over the env index (Bresenham), the rest are pure student.
+        index = torch.arange(self.num_envs, device=self.device, dtype=torch.float64)
+        fraction = cfg.intervention_env_fraction
+        self._mixed_envs = torch.floor((index + 1) * fraction) > torch.floor(index * fraction)
+        self.intervention_tau = float(cfg.intervention_tau_init)
+        self.sac_iters_completed = 0
+        self._rl_total_iters = max(1, self._rl_env_steps() // cfg.train_every)
+        self._hold_left = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        # mixed-env sums since the last tau update: takeover steps, trigger steps, D, steps
+        self._intervention_sums = torch.zeros(4, device=self.device)
+        self._intervention_info = {}
+        getattr(self.env, "base_env", self.env).stats_env_mask = None
+        print(f"[{self.intervention_label}] {int(self._mixed_envs.sum())}/{self.num_envs} mixed envs, target rate "
+              f"{cfg.intervention_rate_init} -> {cfg.intervention_rate_end} over "
+              f"{cfg.intervention_decay_fraction} of {self._rl_total_iters} SAC iterations, "
+              f"hold {cfg.intervention_hold_steps}, tau_init {cfg.intervention_tau_init}.")
+        self._label_teacher = self._teacher_labels
+        if cfg.use_compile:
+            self._label_teacher = torch.compile(self._label_teacher, mode=self.flash_cfg.compile_mode)
+
+    def _print_training_schedule(self):
+        print(f"[DAgger CoSIL joint] teacher warmup {self.cfg.perception_iters} iterations; "
+              "then perception + student SAC with teacher intervention; no refresh cycles.")
+
+    def _training_progress_summary(self):
+        return "joint perception + SAC" if self.stage == 2 else "teacher warmup before joint training"
+
+    def _perception_length(self):
+        return self.cfg.perception_iters
+
+    def _rollout_noise_scale(self, teacher_rollout):
+        return self.cfg.teacher_perception_rollout_noise_scale if teacher_rollout else 1.0
+
+    def _rl_env_steps(self):
+        """Per-env joint steps after the optional one-shot teacher warmup."""
+        horizon = self.cfg.num_env_steps // self.num_envs
+        return max(1, horizon - self.cfg.perception_iters * self.cfg.train_every)
+
+    @property
+    def stats_env_mask(self):
+        """Envs whose episodes train.py logs: the pure-student envs during SAC, all envs otherwise."""
+        return ~self._mixed_envs if self.stage == 2 else None
+
+    def _intervention_target(self):
+        cfg = self.cfg
+        horizon = cfg.intervention_decay_fraction * self._rl_total_iters
+        progress = min(1.0, self.sac_iters_completed / horizon) if horizon > 0 else 1.0
+        return cfg.intervention_rate_init + (cfg.intervention_rate_end - cfg.intervention_rate_init) * progress
+
+    def _teacher_labels(self, raw):
+        # One encoder + actor pass supplies both perception labels and takeovers.
+        feature = self.actor.encode_priv(raw)
+        inputs = torch.cat([self.actor.field(raw, self.actor.command_key),
+                            self.actor.field(raw, OBS_KEY), feature], dim=-1)
+        mean, _ = self.actor.policy.get_mean_and_std(inputs, training=False)
+        return feature, torch.tanh(mean.float())
+
+    @torch.no_grad()
+    def _intervene(self, td, observation, u, *, student_mean_action=None):
+        """Replace the student's sampled action with the teacher's mean where a takeover runs."""
+        # Perception needs labels even after teacher intervention decays to zero.
+        # These cloned outputs belong only to the current transition.
+        feature, teacher_mean_action = self._label_teacher(self.replay_obs(td))
+        td[_TEACHER_FEATURE] = feature.clone()
+        td[_TEACHER_ACTION] = teacher_mean_action.clone()
+        takeover = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        if self._intervention_target() > 0:
+            # clone() each compiled output before the next CUDA graph replay can overwrite it
+            if student_mean_action is None:
+                student_mean, _ = self._student.apply("get_mean_and_std", observation, training=False)
+                student_mean_action = torch.tanh(student_mean.float()).clone()
+            u_student, u_teacher = student_mean_action.float(), td[_TEACHER_ACTION].float()
+            divergence = (u_teacher - u_student).square().sum(-1)
+            hold = self._hold_left.masked_fill(td["is_init"].squeeze(-1), 0)
+            trigger = self._mixed_envs & (divergence > self.intervention_tau)
+            hold = torch.where(trigger, self.cfg.intervention_hold_steps, hold)
+            takeover = hold > 0
+            self._hold_left = (hold - 1).clamp(min=0)
+            u = torch.where(takeover.unsqueeze(-1), u_teacher.to(u.dtype), u)
+            mixed = self._mixed_envs.float()
+            self._intervention_sums += torch.stack([
+                takeover.float().sum(), trigger.float().sum(), (divergence * mixed).sum(), mixed.sum()])
+        td[self.intervened_key] = takeover
+        return u
+
+    def _update_intervention(self):
+        """Once per SAC iteration: move tau so the mixed-env takeover rate follows its target."""
+        target = self._intervention_target()
+        takeover, trigger, divergence, steps = self._intervention_sums.tolist()
+        self._intervention_sums.zero_()
+        if steps > 0:
+            rate = takeover / steps
+            self._intervention_info = {
+                f"{self.intervention_prefix}/takeover_rate": rate,
+                f"{self.intervention_prefix}/trigger_rate": trigger / steps,
+                f"{self.intervention_prefix}/divergence_mixed": divergence / steps}
+            if target > 0:
+                tau = self.intervention_tau * math.exp(self.cfg.intervention_tau_lr * (rate - target))
+                self.intervention_tau = min(max(tau, 1e-3), 1e3)
+        else:
+            self._intervention_info = {f"{self.intervention_prefix}/takeover_rate": 0.0,
+                                       f"{self.intervention_prefix}/trigger_rate": 0.0}
+
+    def _build_adaptation(self, observation_spec):
+        super()._build_adaptation(observation_spec)
+        # Keep the teacher checkpoint's parameter names/shapes; switch only the input keys.
+        keys = [OBS_KEY]
+        if self.cfg.adapt_module_input_cmd:
+            keys.append(VEL_CMD_KEY)
+        keys += [OBJECT_PRED_KEY, OBJECT_PRED_TRANS_KEY]
+        self.adapt_module = Seq(
+            CatTensors(keys, "_adapt_inp", del_keys=False, sort=False),
+            self.adapt_module[1],
+            selected_out_keys=[PRIV_PRED_KEY, ("next", "adapt_hx")],
+        ).to(self.device)
+        self.adapt_ema = copy.deepcopy(self.adapt_module).requires_grad_(False)
+        cnn = nn.Sequential(
+            make_conv(num_channels=[8, 8, 8], activation=nn.Mish, kernel_sizes=5),
+            nn.LazyLinear(self.depth_feature_dim), nn.LayerNorm(self.depth_feature_dim),
+        )
+        self.temporal_depth_gru = TemporalDepthGRU(cnn, self.depth_feature_dim).to(self.device)
+        fake = observation_spec.zero()[:2].to(self.device)
+        fake["is_init"] = torch.ones(2, 1, dtype=torch.bool, device=self.device)
+        fake["depth_hx"] = torch.zeros(2, self.depth_feature_dim, device=self.device)
+        with torch.no_grad():
+            self.temporal_depth_gru(fake)
+        for module in cnn.modules():
+            if isinstance(module, (nn.Linear, nn.Conv2d)):
+                nn.init.orthogonal_(module.weight, 0.01)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+        self.temporal_depth_gru_ema = copy.deepcopy(self.temporal_depth_gru).requires_grad_(False)
+        self.opt_adapt = optim.Adam(self._perception_parameters(), lr=self.cfg.adapt_learning_rate)
+
+    def _perception_pairs(self):
+        return ((self.temporal_depth_gru, self.temporal_depth_gru_ema),
+                (self.object_adapt, self.object_adapt_ema),
+                (self.adapt_module, self.adapt_ema))
+
+    def _perception_parameters(self):
+        return [p for model in (self.temporal_depth_gru, self.object_adapt, self.adapt_module)
+                for p in model.parameters()]
+
+    def make_tensordict_primer(self):
+        return TensorDictPrimer({
+            "adapt_hx": Unbounded((self.num_envs, self.cfg.latent_dim), device=self.device),
+            "depth_hx": Unbounded((self.num_envs, self.depth_feature_dim), device=self.device),
+        }, reset_key="done")
+
+    def get_rollout_policy(self, mode="train"):
+        return DAggerJointRollout(self, mode)
+
+    def _perceive(self, td, ema):
+        depth, obj, adapt = (
+            (self.temporal_depth_gru_ema, self.object_adapt_ema, self.adapt_ema) if ema
+            else (self.temporal_depth_gru, self.object_adapt, self.adapt_module)
+        )
+        # PPOVEL's single-step GRU assumes its caller resets hidden states.
+        # Also mask explicitly here for manual next-observation and evaluation calls.
+        if td.ndim == 1:
+            for key in ("depth_hx", "adapt_hx"):
+                td[key] = torch.where(td["is_init"], 0., td[key])
+        depth(td)
+        obj(td)
+        td[OBJECT_PRED_TRANS_KEY] = self.actor.transform_object_pose(td[OBJECT_PRED_KEY])
+        adapt(td)
+        return td
+
+    def _joint_action(self, u, td):
+        if self.cfg.action_mode == "residual":
+            return td[REF_JPOS_KEY] + self.cfg.residual_scale * u
+        return self.cfg.action_scale * u
+
+    @torch.no_grad()
+    def add_transition(self, td):
+        if self.stage == 1:
+            self._collect_perception_transition(td)
+            return
+
+        next_td = td["next"]
+        if ACTION_DR_KEY in self.replay_keys:
+            next_td[ACTION_DR_KEY] = td[ACTION_DR_KEY]
+        # Use the post-action observation and the hidden state produced at s_t. Do NOT
+        # reset on done here: truncations bootstrap from the terminal, pre-reset state.
+        perception_next = TensorDict({
+            OBS_KEY: next_td[OBS_KEY], VEL_CMD_KEY: next_td[VEL_CMD_KEY],
+            DEPTH_KEY: next_td[DEPTH_KEY],
+            "is_init": torch.zeros_like(td["is_init"]),
+            "adapt_hx": next_td["adapt_hx"], "depth_hx": next_td["depth_hx"],
+        }, batch_size=td.batch_size, device=self.device)
+        self._perceive(perception_next, ema=True)
+        next_obs = self._student_replay_obs(next_td, perception_next[PRIV_PRED_KEY])
+        if self.buffer is None:
+            self._allocate_student_replay()
+        # Later rows already hold s_t as the previous transition's next_obs.
+        current_obs = (self._student_replay_obs(td, td[PRIV_PRED_KEY])
+                       if self.buffer.step == 0 else None)
+        terminated = next_td["terminated"].squeeze(-1)
+        truncated = next_td["truncated"].squeeze(-1)
+        cut = terminated
+        if not self.cfg.bootstrap_on_command_finished:
+            time_limit = next_td["step_count"].squeeze(-1) >= self.env.max_episode_length
+            cut = cut | (truncated & ~time_limit)
+        reward = next_td["reward"].sum(-1)
+        intervened = td.get(self.intervened_key, None)
+        if intervened is None:
+            intervened = torch.zeros_like(terminated)
+        self.buffer.add(
+            obs=current_obs, next_obs=next_obs,
+            action=td[U_KEY], reward=reward, discount=next_td["discount"].squeeze(-1),
+            done=terminated | truncated, cut=cut, valid=td["step_count"].squeeze(-1) > 1,
+            intervened=intervened,
+        )
+        if self.reward_normalizer is not None:
+            self.reward_normalizer.update_reward_stats(reward, terminated, truncated)
+        self._rl_steps_in_iteration += 1
+        if self._rl_steps_in_iteration == self.cfg.train_every:
+            self.finetune_iters_completed += 1
+            self.rl_phase_iters_completed += 1
+            self.sac_iters_completed += 1
+            self._rl_steps_in_iteration = 0
+        self._collect_perception_transition(td)
+
+    @torch.no_grad()
+    def _collect_perception_transition(self, td):
+        keys = [OBS_KEY, VEL_CMD_KEY, DEPTH_KEY, OBJECT_KEY, REF_JPOS_KEY,
+                "is_init", "adapt_hx", "depth_hx"]
+        step = td.select(*keys)
+        # Teacher labels for _train_perception, computed per step (the teacher is frozen), so
+        # neither the full replay observation nor one large teacher call is needed later.
+        step[PRIV_FEATURE_KEY], step["_teacher_action"] = self._perception_labels(td)
+        if self.reuse_rollout_predictions and self.stage == 2:
+            # Command/policy inputs are already in this buffer; only cache the latent.
+            step["_rollout_priv_pred"] = td[PRIV_PRED_KEY].detach()
+        if self._adapt_t == 0:
+            # One [num_envs, train_every] buffer per iteration, filled in place.
+            n, t = step.shape[0], self.cfg.train_every
+            self._adapt_buffer = TensorDict(
+                {k: torch.empty(n, t, *v.shape[1:], dtype=v.dtype, device=v.device)
+                 for k, v in step.items()}, batch_size=[n, t], device=self.device)
+        self._adapt_buffer[:, self._adapt_t] = step
+        self._adapt_t += 1
+        if self._adapt_t == self.cfg.train_every:
+            self._pending_adapt, self._adapt_buffer, self._adapt_t = self._adapt_buffer, None, 0
+
+    def _perception_labels(self, td):
+        if self.stage == 2 and _TEACHER_FEATURE in td.keys() and _TEACHER_ACTION in td.keys():
+            feature, mean_action = td[_TEACHER_FEATURE], td[_TEACHER_ACTION]
+        else:
+            # Optional warmup or an externally supplied transition without cached labels.
+            feature, mean_action = self._label_teacher(self.replay_obs(td))
+            feature, mean_action = feature.clone(), mean_action.clone()
+        return feature, self._joint_action(mean_action, td)
+
+    def _student_replay_obs(self, td, latent):
+        return torch.cat([self.replay_obs(td), td[VEL_CMD_KEY], latent], dim=-1)
+
+    def _allocate_student_replay(self):
+        storage = "cpu" if self.cfg.buffer_device_type == "cpu" else self.device
+        if torch.device(storage).type == "cuda":
+            capacity = max(self.cfg.buffer_max_length // self.num_envs, self.cfg.n_step + 2) * self.num_envs
+            itemsize = torch.finfo(getattr(torch, self.cfg.buffer_obs_dtype)).bits // 8
+            required = capacity * (self.student_replay_dim * itemsize + self.action_dim * 4 + 16)
+            free, _ = torch.cuda.mem_get_info(self.device)
+            if required > free - 4 * 2**30:
+                raise MemoryError("Student replay exceeds free GPU memory; use algo.buffer_device_type=cpu "
+                                  "or reduce algo.buffer_max_length")
+        self.buffer = InterventionNStepReplay(
+            num_envs=self.num_envs, obs_dim=self.student_replay_dim, action_dim=self.action_dim,
+            n_step=self.cfg.n_step, gamma=self.cfg.gamma, max_length=self.cfg.buffer_max_length,
+            min_length=self.cfg.buffer_min_length, batch_size=self.cfg.sample_batch_size,
+            device=self.device, obs_dtype=getattr(torch, self.cfg.buffer_obs_dtype), storage_device=storage,
+        )
+        print(f"[FlashSAC finetune] replay {self.buffer.capacity} rows, "
+              f"{self.buffer.nbytes() / 2**30:.2f} GiB on {self.buffer.storage}")
+
+    def update(self):
+        if self.stage == 1:
+            if self._pending_adapt is not None:
+                info = self._train_perception(self._pending_adapt)
+                self._pending_adapt = None
+                for key, value in info.items():
+                    self._info_sum[key] = self._info_sum.get(key, 0.) + value.detach()
+                    self._info_cnt[key] = self._info_cnt.get(key, 0) + 1
+                self.perception_iters_completed += 1
+                self.finetune_iters_completed += 1
+                if self.perception_iters_completed >= self._perception_length():
+                    self._start_rl()
+            return
+        # SAC waits for replay readiness; supervised perception starts immediately.
+        FlashSACVelFlat.update(self)
+        if self._pending_adapt is not None:
+            info = self._train_perception(self._pending_adapt, distill_actor=False)
+            self._pending_adapt = None
+            self.joint_perception_iters_completed += 1
+            for key, value in info.items():
+                self._info_sum[key] = self._info_sum.get(key, 0.) + value.detach()
+                self._info_cnt[key] = self._info_cnt.get(key, 0) + 1
+            # Exactly once per completed rollout iteration, including replay fill.
+            self._update_intervention()
+
+    @torch.no_grad()
+    def _prepare_perception_monitor(self, rollout, distill_actor):
+        # Actor weights, collected latents and teacher labels do not change during
+        # supervised perception epochs. Compute their diagnostic once per sample.
+        # Rebuild each call: no cache may survive the next SAC/rollout update.
+        rollout.pop("_monitor_action_squared_error", None)
+        if distill_actor or self.cfg.adapt_epochs <= 1 or "_rollout_priv_pred" not in rollout.keys():
+            return
+        errors = torch.empty_like(rollout["_teacher_action"])
+        envs_per_batch = rollout.shape[0] // self.cfg.adapt_num_minibatches
+        for start in range(0, rollout.shape[0], envs_per_batch):
+            batch = rollout[start:start + envs_per_batch]
+            inputs = torch.cat([batch[VEL_CMD_KEY], batch[OBS_KEY],
+                                batch["_rollout_priv_pred"]], dim=-1).flatten(0, 1)
+            mean, _ = self.actor_adapt.get_mean_and_std(inputs, training=False)
+            action = self._joint_action(torch.tanh(mean).reshape(*batch.batch_size, self.action_dim), batch)
+            errors[start:start + envs_per_batch] = (action - batch["_teacher_action"]).square()
+        # Keep elementwise errors so each original shuffled minibatch computes the
+        # same masked mean/sqrt; no change to RNG, loss, minibatches or optimizer steps.
+        rollout["_monitor_action_squared_error"] = errors
+
+    @set_recurrent_mode(True)
+    def _train_perception(self, rollout, *, distill_actor=None):
+        if distill_actor is None:
+            distill_actor = self.stage == 1
+        self._prepare_perception_monitor(rollout, distill_actor)
+        # rollout already holds the teacher labels PRIV_FEATURE_KEY and _teacher_action.
+        infos = []
+        for _ in range(self.cfg.adapt_epochs):
+            for batch in make_batch(rollout, self.cfg.adapt_num_minibatches, self.cfg.train_every):
+                self._perceive(batch, ema=False)
+                valid = (~batch["is_init"]).float()
+                priv_loss = ((batch[PRIV_PRED_KEY] - batch[PRIV_FEATURE_KEY]).square() * valid).mean()
+                object_loss = ((batch[OBJECT_PRED_KEY] - batch[OBJECT_KEY]).square() * valid).mean()
+                priv_pred_norm = batch[PRIV_PRED_KEY].detach().norm(dim=-1).mean()
+                depth_feature_norm = batch["_depth_feature"].detach().norm(dim=-1).mean()
+                self.opt_adapt.zero_grad(set_to_none=True)
+                (priv_loss + object_loss).backward()
+                nn.utils.clip_grad_norm_(self._perception_parameters(), self.cfg.max_grad_norm)
+                self.opt_adapt.step()
+                # Joint monitoring can use the actual rollout inputs. Re-running the
+                # EMA depth/GRUs adds no training signal when the actor is not distilled.
+                monitor_error = (batch.get("_monitor_action_squared_error", None)
+                                 if not distill_actor else None)
+                if monitor_error is not None:
+                    inputs = None  # This diagnostic was computed once for the whole rollout.
+                elif not distill_actor and "_rollout_priv_pred" in batch.keys():
+                    inputs = torch.cat([batch[VEL_CMD_KEY], batch[OBS_KEY],
+                                        batch["_rollout_priv_pred"]], dim=-1).flatten(0, 1)
+                else:
+                    with torch.no_grad():
+                        self._perceive(batch, ema=True)
+                    inputs = self._actor_adapt_input(batch).flatten(0, 1).detach()
+                info = {
+                    "adapt/priv_loss": priv_loss.detach(), "adapt/object_loss": object_loss.detach(),
+                    "adapt/priv_feature_norm": batch[PRIV_FEATURE_KEY].norm(dim=-1).mean().detach(),
+                    "adapt/priv_pred_norm": priv_pred_norm,
+                    "adapt/depth_feature_norm": depth_feature_norm,
+                }
+                if not distill_actor:
+                    # The actor is handled separately; only monitor its distance from the teacher.
+                    with torch.no_grad():
+                        if monitor_error is None:
+                            student_mean, _ = self.actor_adapt.get_mean_and_std(inputs, training=False)
+                            student_action = self._joint_action(
+                                torch.tanh(student_mean).reshape(*batch.batch_size, self.action_dim), batch)
+                            monitor_error = (student_action - batch["_teacher_action"]).square()
+                        mse = (monitor_error * valid).mean()
+                    info["adapt/teacher_student_action_rmse"] = mse.sqrt()
+                    infos.append(info)
+                    continue
+                student_mean, _ = self.actor_adapt.get_mean_and_std(inputs, training=True)
+                student_action = self._joint_action(
+                    torch.tanh(student_mean).reshape(*batch.batch_size, self.action_dim), batch)
+                adapt_loss = ((student_action - batch["_teacher_action"]).square() * valid).mean()
+                self.opt_adapt_actor.zero_grad(set_to_none=True)
+                adapt_loss.backward()
+                nn.utils.clip_grad_norm_(self.actor_adapt.parameters(), self.cfg.max_grad_norm)
+                self.opt_adapt_actor.step()
+                self._normalize_actor_adapt_parameters()
+                info["adapt/adapt_loss"] = adapt_loss.detach()
+                info["adapt/teacher_student_action_rmse"] = adapt_loss.detach().sqrt()
+                infos.append(info)
+        with torch.no_grad():
+            for source, target in self._perception_pairs():
+                for src, dst in zip(source.parameters(), target.parameters()):
+                    dst.lerp_(src, self.cfg.perception_ema_tau)
+        return {k: torch.stack([i[k] for i in infos]).mean() for k in infos[0]}
+
+    def _prepare_rl_perception(self):
+        for online, ema in self._perception_pairs():
+            online.requires_grad_(True).train()
+            ema.requires_grad_(False).eval()
+        return "perception continues training and EMA continues updating"
+
+    def _start_rl(self, schedule_updates=None):
+        perception_status = self._prepare_rl_perception()
+        self.actor_adapt.requires_grad_(True)
+        self.critic.requires_grad_(True)
+        self.temperature.requires_grad_(True)
+        self.stage = 2
+        self.rl_phase_iters_completed = 0
+        self._reset_phase_rollout()
+        # Reward EMAs (env.stats_ema) and train/stats come from the pure-student envs only.
+        getattr(self.env, "base_env", self.env).stats_env_mask = ~self._mixed_envs
+        print(f"[FlashSAC finetune] Stage 2: {perception_status}; student SAC enabled. "
+              "Resetting environments/hidden states; replay starts empty.")
+        if self._student is not None:
+            # Preserve optimizer/scheduler state if joint training is already initialized.
+            return
+        # Existing critic/temperature optimizers are fresh when loading a teacher. They
+        # have not stepped during perception phase. Student SAC gets a separate fresh optimizer.
+        optimizer = optim.Adam(self.actor_adapt.parameters(), lr=self.cfg.learning_rate_peak,
+                               fused=self.device.type == "cuda")
+        steps = self._rl_env_steps()
+        updates = schedule_updates or max(1, int(steps * self.cfg.updates_per_interaction_step))
+        self._rl_schedule_updates = updates
+
+        def lr_lambda(num_steps):
+            schedule = ramp_cosine_decay_scheduler(
+                init_value=self.cfg.learning_rate_init, peak_value=self.cfg.learning_rate_peak,
+                end_value=self.cfg.learning_rate_end,
+                ramp_steps=int(self.cfg.learning_rate_ramp_rate * num_steps),
+                decay_steps=max(1, int(self.cfg.learning_rate_decay_rate * num_steps)),
+            )
+            return lambda step: schedule(step) / self.cfg.learning_rate_peak
+
+        # The critic steps on every update; actor and temperature step every
+        # actor_update_period updates. Checkpoint resume restores these schedules.
+        actor_updates = max(1, updates // self.flash_cfg.actor_update_period)
+        self._critic.scheduler = torch.optim.lr_scheduler.LambdaLR(
+            self._critic.optimizer, lr_lambda=lr_lambda(updates))
+        self._temperature.scheduler = torch.optim.lr_scheduler.LambdaLR(
+            self._temperature.optimizer, lr_lambda=lr_lambda(actor_updates))
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda(actor_updates))
+        self._student = Network(
+            self.actor_adapt, optimizer, scheduler,
+            compile_network=self.cfg.use_compile, compile_mode=self.flash_cfg.compile_mode,
+            use_weight_normalization=True,
+        )
+        if self.cfg.use_compile:
+            self._student.network.get_mean_and_std = torch.compile(
+                self._student.network.get_mean_and_std, mode=self.flash_cfg.compile_mode)
+        self._student.normalize_parameters()
+        if self.cfg.cosil_mode != "entropy":
+            # CoSIL coefficient, built like FlashSAC's temperature and stepped with the actor.
+            beta_net = FlashSACTemperature(self.cfg.beta_init).to(self.device)
+            beta_optimizer = optim.Adam(beta_net.parameters(), lr=self.cfg.learning_rate_peak,
+                                        fused=self.device.type == "cuda")
+            self._beta = Network(beta_net, beta_optimizer, torch.optim.lr_scheduler.LambdaLR(
+                beta_optimizer, lr_lambda=lr_lambda(actor_updates)))
+        self._update_step = 0
+
+    def _reset_phase_rollout(self):
+        self.buffer = None
+        self._adapt_buffer, self._adapt_t = None, 0
+        self._pending_adapt = None
+        self._rl_steps_in_iteration = 0
+        self._update_counter = 0.
+        self._cur_noise_repeat_count.zero_()
+        self._cur_noise_repeat_n.fill_(1)
+        if self.reward_normalizer is not None:
+            self.reward_normalizer.G_r.zero_()
+        self._hold_left.zero_()
+        self._intervention_sums.zero_()
+        self.needs_env_reset = True
+        if self.device.type == "cuda":
+            # Return the finished phase's cached blocks so the simulator (PhysX) can use them.
+            torch.cuda.empty_cache()
+
+    def _update_once(self):
+        if self.cfg.cosil_mode == "entropy":
+            return self._flashsac_update_once()
+        batch = self.buffer.sample()
+        for key, actor_key, teacher_key in (
+                ("observation", "actor_observation", "teacher_observation"),
+                ("next_observation", "actor_next_observation", "teacher_next_observation")):
+            obs = batch[key]
+            batch[actor_key] = obs.index_select(-1, self._student_replay_index)
+            batch[teacher_key] = obs[..., :self.replay_obs_dim]  # the teacher's own input
+            batch[key] = self.critic_obs(obs)
+        if self.reward_normalizer is not None:
+            batch["reward"] = self.reward_normalizer.normalize_rewards(batch["reward"])
+        info = self._cosil_update_networks(
+            batch, do_actor_update=self._update_step % self.flash_cfg.actor_update_period == 0)
+        self._update_step += 1
+        return info
+
+    def _flashsac_update_once(self):
+        """Entropy-only SAC update on stored student observations."""
+        batch = self.buffer.sample()
+        for key, actor_key in (("observation", "actor_observation"),
+                               ("next_observation", "actor_next_observation")):
+            obs = batch[key]
+            batch[actor_key] = obs.index_select(-1, self._student_replay_index)
+            batch[key] = self.critic_obs(obs)
+        if self.reward_normalizer is not None:
+            batch["reward"] = self.reward_normalizer.normalize_rewards(batch["reward"])
+        info = _update_networks(
+            batch=batch, actor=self._student, critic=self._critic, target_critic=self._target_critic,
+            temperature=self._temperature, cfg=self.flash_cfg,
+            do_actor_update=self._update_step % self.flash_cfg.actor_update_period == 0,
+            device=self.device, grad_scaler=self._grad_scaler,
+        )
+        self._update_step += 1
+        return info
+
+    def _sample_student(self, observations, training):
+        """FlashSAC's tanh-Gaussian policy sample, also returning the mean for D."""
+        mean, std = self._student.apply("get_mean_and_std", observations, training=training)
+        raw = mean + std * torch.randn_like(mean)
+        log_prob = torch.distributions.Normal(mean, std).log_prob(raw) - safe_tanh_log_det_jacobian(raw)
+        return torch.tanh(raw), log_prob.sum(-1), torch.tanh(mean)
+
+    def _optimizer_step(self, network, loss):
+        # Same step as flashsac_upstream.update (shared AMP grad scaler, LR schedule, weight norm).
+        network.optimizer.zero_grad(set_to_none=True)
+        if self.flash_cfg.use_amp:
+            self._grad_scaler.scale(loss).backward()
+            self._grad_scaler.step(network.optimizer)
+            self._grad_scaler.update()
+        else:
+            loss.backward()
+            network.optimizer.step()
+        if network.scheduler is not None:
+            network.scheduler.step()
+
+    def _cosil_teacher_actions(self, batch, do_actor_update):
+        if do_actor_update:
+            observations = torch.cat([batch["teacher_observation"], batch["teacher_next_observation"]])
+            mean, _ = self.actor.get_mean_and_std(observations, training=False)
+            return torch.tanh(mean.float()).clone().chunk(2)
+        # Critic-only steps use mu(s') in the target, never mu(s).
+        mean, _ = self.actor.get_mean_and_std(batch["teacher_next_observation"], training=False)
+        return None, torch.tanh(mean.float()).clone()
+
+    def _cosil_update_networks(self, batch, do_actor_update):
+        """flashsac_upstream.agent._update_networks with the CoSIL actor, beta and critic target."""
+        cfg, device = self.flash_cfg, self.device
+        entropy_on = self.cfg.cosil_mode == "cosil_entropy"
+        student, critic, target_critic = self._student, self._critic, self._target_critic
+        with torch.no_grad():  # state expert mu(s), mu(s') from the frozen teacher
+            mu, mu_next = self._cosil_teacher_actions(batch, do_actor_update)
+        info = {}
+        if do_actor_update:
+            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=cfg.use_amp):
+                actor_obs_all = torch.cat([batch["actor_observation"], batch["actor_next_observation"]])
+                actions_all, log_probs_all, mean_actions_all = self._sample_student(actor_obs_all, True)
+                actions = actions_all.chunk(2)[0]
+                log_probs = log_probs_all.chunk(2)[0]
+                divergence = (mu - mean_actions_all.chunk(2)[0].float()).square().sum(-1)
+                # Disable critic gradients to prevent CUDA graph overwriting (as upstream).
+                critic.network.requires_grad_(False)
+                qs, _ = critic(observations=batch["observation"], actions=actions, training=False)
+                q = torch.minimum(qs[0], qs[1])
+                critic.network.requires_grad_(True)
+                beta = self._beta().detach()
+                actor_loss = beta * divergence - q
+                if entropy_on:
+                    actor_loss = actor_loss + self._temperature().detach() * log_probs
+                actor_loss = actor_loss.mean()
+                entropy = -log_probs.mean()
+                mean_action = actions.mean()
+            self._optimizer_step(student, actor_loss)
+            student.normalize_parameters()
+            info.update({"actor/loss": actor_loss.detach(), "actor/entropy": entropy.detach(),
+                         "actor/mean_action": mean_action.detach()})
+            # beta: grows while E[D] > target_divergence, shrinks below it.
+            divergence_mean = divergence.detach().float().mean()
+            beta_value = self._beta()
+            beta_loss = beta_value * (self.cfg.target_divergence - divergence_mean)
+            self._beta.optimizer.zero_grad(set_to_none=True)
+            beta_loss.backward()
+            self._beta.optimizer.step()
+            self._beta.scheduler.step()
+            info.update({"cosil/divergence": divergence_mean, "cosil/beta": beta_value.detach().squeeze(),
+                         "cosil/beta_loss": beta_loss.detach().squeeze()})
+            if entropy_on:
+                info.update(update_temperature(
+                    temperature=self._temperature, entropy=entropy.detach(),
+                    target_entropy=cfg.temp_target_entropy))
+
+        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=cfg.use_amp):
+            with torch.no_grad():
+                next_actions, next_log_probs, next_mean_actions = self._sample_student(
+                    batch["actor_next_observation"], False)
+                next_actions = next_actions.clone()
+                next_divergence = (mu_next - next_mean_actions.float()).square().sum(-1)
+                penalty = self._beta().detach().squeeze() * next_divergence
+                if entropy_on:
+                    penalty = penalty + self._temperature().detach().squeeze() * next_log_probs.clone().float()
+                obs_all = torch.cat([batch["observation"], batch["next_observation"]])
+                act_all = torch.cat([batch["action"], next_actions])
+                qs_all, q_infos_all = target_critic(observations=obs_all, actions=act_all, training=True)
+                next_qs = qs_all.chunk(2, dim=1)[1]
+                next_q_log_probs = _select_min_q_log_probs(next_qs, q_infos_all["log_prob"].chunk(2, dim=1)[1])
+                target_probs = _compute_categorical_td_target(
+                    target_log_probs=next_q_log_probs, reward=batch["reward"], done=batch["terminated"],
+                    actor_entropy=penalty, gamma=cfg.gamma ** cfg.n_step, num_bins=cfg.critic_num_bins,
+                    min_v=cfg.critic_min_v, max_v=cfg.critic_max_v)
+            _, pred_q_infos = critic(observations=obs_all, actions=act_all, training=True)
+            pred_log_probs = pred_q_infos["log_prob"].chunk(2, dim=1)[0]
+            critic_loss = -(target_probs.unsqueeze(0) * pred_log_probs).sum(dim=-1).mean()
+        self._optimizer_step(critic, critic_loss)
+        critic.normalize_parameters()
+        update_target_network(target_network=target_critic)
+        info.update({"critic/loss": critic_loss.detach(), "critic/max_penalty": penalty.max()})
+        return info
+
+    def pop_info(self):
+        info = FlashSACVelFlat.pop_info(self)
+        info.update({
+            "finetune/stage": self.stage,
+            "finetune/iters_completed": self.finetune_iters_completed,
+            "finetune/joint_active": int(self.stage == 2),
+            "finetune/teacher_perception_iters_completed": self.perception_iters_completed,
+            "finetune/joint_perception_iters_completed": self.joint_perception_iters_completed,
+            "finetune/joint_iters_completed": self.rl_phase_iters_completed,
+        })
+        optimizer = self.opt_adapt_actor if self.stage == 1 else self._student.optimizer
+        info["actor/lr"] = optimizer.param_groups[0]["lr"]
+        if self._beta is not None:
+            info["cosil/beta_value"] = self._beta().item()
+        if self.stage == 2:
+            info.update(self._intervention_info)
+            info.update({"dagger/tau": self.intervention_tau,
+                         "dagger/target_rate": self._intervention_target(),
+                         "dagger/sac_iters_completed": self.sac_iters_completed})
+        return info
+
+    def state_dict(self):
+        state = super().state_dict()
+        state["finetune_version"] = 6
+        state["finetune_method"] = "dagger_cosil_joint_v1"
+        state["finetune_stage"] = self.stage
+        state["perception_iters_completed"] = self.perception_iters_completed
+        state["finetune_iters_completed"] = self.finetune_iters_completed
+        state["student_replay_dim"] = self.student_replay_dim
+        state["student_replay_index"] = self._student_replay_index.cpu()
+        state["perception_iters"] = self.cfg.perception_iters
+        state["rl_phase_iters_completed"] = self.rl_phase_iters_completed
+        for name in ("temporal_depth_gru", "temporal_depth_gru_ema"):
+            state[name] = getattr(self, name).state_dict()
+        if self._student is not None:
+            state["rl_schedule_updates"] = self._rl_schedule_updates
+            state["student_optimizer"] = self._student.optimizer.state_dict()
+            state["student_scheduler"] = self._student.scheduler.state_dict()
+        if self._beta is not None:
+            state["cosil_beta"] = self._beta.network.state_dict()
+            state["cosil_beta_optimizer"] = self._beta.optimizer.state_dict()
+            state["cosil_beta_scheduler"] = self._beta.scheduler.state_dict()
+        state["cosil_mode"] = self.cfg.cosil_mode
+        state[f"{self.intervention_prefix}_intervention_tau"] = self.intervention_tau
+        state[f"{self.intervention_prefix}_sac_iters_completed"] = self.sac_iters_completed
+        state["joint_perception_iters_completed"] = self.joint_perception_iters_completed
+        # Retain the original intervention-decay horizon across resume.
+        state["dagger_rl_total_iters"] = self._rl_total_iters
+        return state
+
+    def load_state_dict(self, state_dict, strict=True):
+        joint = state_dict.get("finetune_method") == "dagger_cosil_joint_v1"
+        if "finetune_version" in state_dict and not joint:
+            raise ValueError("DAgger CoSIL joint requires a teacher or DAgger CoSIL joint checkpoint")
+        completed = state_dict.get("joint_perception_iters_completed", 0)
+        horizon = state_dict.get("dagger_rl_total_iters", self._rl_total_iters)
+        for name, value, minimum in (("joint perception counter", completed, 0),
+                                     ("intervention decay horizon", horizon, 1)):
+            if isinstance(value, bool) or not isinstance(value, Integral) or value < minimum:
+                raise ValueError(f"Invalid {name}")
+        resume = state_dict.get("finetune_version") == 6
+        if "finetune_version" in state_dict and not resume:
+            raise ValueError("Unsupported finetune checkpoint version")
+        if state_dict.get("actor_adapt_arch") != "flashsac_v1":
+            raise ValueError("Finetune requires a teacher checkpoint with FlashSAC actor_adapt")
+        if resume:
+            if state_dict["finetune_stage"] not in (1, 2):
+                raise ValueError("Invalid finetune stage in checkpoint")
+            if (state_dict["student_replay_dim"] != self.student_replay_dim or
+                    not torch.equal(state_dict["student_replay_index"].cpu(), self._student_replay_index.cpu())):
+                raise ValueError("Student observation layout differs from the saved finetune checkpoint")
+            self._warn_schedule_change(state_dict)
+        # The parent's loader validates the teacher critic/replay/action layouts. On transfer,
+        # omit teacher optimizer/counters: this is a new phase, not continued teacher training.
+        transfer = dict(state_dict)
+        if not resume:
+            for key in list(transfer):
+                if key.endswith(("_optimizer", "_scheduler")) or key in (
+                    "opt_adapt", "opt_adapt_actor", "grad_scaler", "update_step", "last_iter"
+                ):
+                    transfer.pop(key)
+        super().load_state_dict(transfer, strict=strict)
+        if resume:
+            for name in ("temporal_depth_gru", "temporal_depth_gru_ema"):
+                getattr(self, name).load_state_dict(state_dict[name], strict=strict)
+            self.finetune_iters_completed = state_dict["finetune_iters_completed"]
+            if "student_optimizer" in state_dict:
+                self._start_rl(schedule_updates=state_dict.get("rl_schedule_updates"))
+                self._student.optimizer.load_state_dict(state_dict["student_optimizer"])
+                self._student.scheduler.load_state_dict(state_dict["student_scheduler"])
+                for name, network in (("critic", self._critic), ("temperature", self._temperature)):
+                    network.optimizer.load_state_dict(state_dict[f"{name}_optimizer"])
+                    network.scheduler.load_state_dict(state_dict[f"{name}_scheduler"])
+                self._update_step = state_dict["update_step"]
+                # A checkpoint from entropy-only mode has no beta state.
+                if "cosil_beta" in state_dict and self._beta is not None:
+                    self._beta.network.load_state_dict(state_dict["cosil_beta"])
+                    self._beta.optimizer.load_state_dict(state_dict["cosil_beta_optimizer"])
+                    self._beta.scheduler.load_state_dict(state_dict["cosil_beta_scheduler"])
+            self.perception_iters_completed = state_dict["perception_iters_completed"]
+            self.rl_phase_iters_completed = state_dict.get("rl_phase_iters_completed", 0)
+            # Accept legacy intervention-key names from earlier DAgger joint checkpoints.
+            self.intervention_tau = state_dict.get(f"{self.intervention_prefix}_intervention_tau",
+                                                   state_dict.get("gaddpg_intervention_tau", self.intervention_tau))
+            self.sac_iters_completed = state_dict.get(f"{self.intervention_prefix}_sac_iters_completed",
+                                                      state_dict.get("gaddpg_sac_iters_completed", 0))
+        elif self.cfg.perception_iters == 0:
+            self._start_rl()
+        self.joint_perception_iters_completed = int(completed)
+        self._rl_total_iters = int(horizon)
+        if self.reward_normalizer is not None:
+            self.reward_normalizer.G_r.zero_()
+        self._checkpoint_loaded = True
+        # The training loop resets the simulator at startup. Replay/hidden state are intentionally
+        # not checkpointed, and RL resumes by filling a fresh buffer with the warm-start actor.
+        self.needs_env_reset = False
+        self.env.set_progress(self.finetune_iters_completed)
+        print(f"[FlashSAC finetune] {'resumed' if resume else 'loaded teacher'}; "
+              f"stage={self.stage}, perception phase={self.perception_iters_completed}/{self._perception_length()}, "
+              f"{self._training_progress_summary()}")
+        return []
+
+    def _warn_schedule_change(self, state):
+        if "perception_iters" in state and state["perception_iters"] != self.cfg.perception_iters:
+            print("[DAgger CoSIL joint] WARNING: teacher warmup changed from "
+                  f"{state['perception_iters']} to {self.cfg.perception_iters} iterations.")

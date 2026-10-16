@@ -54,26 +54,26 @@ class FlashSACVelFinetuneConfig(FlashSACVelConfig):
     # False preserves the fixed num_cycles schedule below.
     cycle_mode: bool = True
     # Pilot candidate from frozen-actor probes, not a guaranteed performance margin.
-    perception_trigger: float = 0.03
+    perception_trigger: float = 0.06
     # Aggregate rollout MSE over this many iterations before taking its square root.
     perception_error_window: int = 20
     perception_trigger_patience: int = 3
     # Compare two adjacent windows every check_interval; stop after patience checks
     # with less than plateau_tol relative RMSE improvement (including deterioration).
-    plateau_window: int = 40
+    plateau_window: int = 20
     plateau_tol: float = 0.0018
     plateau_patience: int = 3
     plateau_check_interval: int = 10
     cycle_perception_iters_min: int = 1
     cycle_perception_iters_max: int = 300
-    cycle_sac_iters_min: int = 100
-    cycle_sac_iters_max: int = 1000
+    cycle_sac_iters_min: int = 300
+    cycle_sac_iters_max: int = 500
     # At the nominal training budget, finish any current refresh naturally, then
     # require this many uninterrupted SAC phase iterations (including replay fill).
     # An existing SAC phase counts toward this length; 0 disables the final tail.
     final_sac_iters: int = 200
     # Initial teacher-rollout perception training, in both modes.
-    perception_iters: int = 500
+    perception_iters: int = 200
     # Fixed mode only: first SAC, followed by num_cycles repeats and final SAC.
     # Adaptive mode ignores all four fixed schedule settings.
     sac_iters: int = 1000
@@ -150,6 +150,8 @@ class FinetuneRollout(TensorDictModuleBase):
 
 
 class FlashSACVelFinetune(FlashSACVel):
+    reuse_rollout_predictions = False
+
     def __init__(self, cfg, observation_spec, action_spec, reward_spec, device, env):
         if cfg.perception_iters < 0 or cfg.adapt_epochs < 1:
             raise ValueError("perception_iters must be >= 0 and adapt_epochs >= 1")
@@ -216,6 +218,9 @@ class FlashSACVelFinetune(FlashSACVel):
             *range(policy_start, policy_end),
             *range(self.replay_obs_dim + self.vel_command_dim, self.student_replay_dim),
         ], device=self.device)
+        self._label_teacher = self._teacher_labels
+        if cfg.use_compile:
+            self._label_teacher = torch.compile(self._label_teacher, mode=self.flash_cfg.compile_mode)
         self._print_training_schedule()
 
     def _print_training_schedule(self):
@@ -421,10 +426,12 @@ class FlashSACVelFinetune(FlashSACVel):
             "adapt_hx": next_td["adapt_hx"], "depth_hx": next_td["depth_hx"],
         }, batch_size=td.batch_size, device=self.device)
         self._perceive(perception_next, ema=True)
-        current_obs = self._student_replay_obs(td, td[PRIV_PRED_KEY])
         next_obs = self._student_replay_obs(next_td, perception_next[PRIV_PRED_KEY])
         if self.buffer is None:
             self._allocate_student_replay()
+        # After the first row, the preceding next_obs already occupies this slot.
+        current_obs = (self._student_replay_obs(td, td[PRIV_PRED_KEY])
+                       if self.buffer.step == 0 else None)
         terminated = next_td["terminated"].squeeze(-1)
         truncated = next_td["truncated"].squeeze(-1)
         cut = terminated
@@ -433,7 +440,7 @@ class FlashSACVelFinetune(FlashSACVel):
             cut = cut | (truncated & ~time_limit)
         reward = next_td["reward"].sum(-1)
         self.buffer.add(
-            obs=current_obs if self.buffer.step == 0 else None, next_obs=next_obs,
+            obs=current_obs, next_obs=next_obs,
             action=td[U_KEY], reward=reward, discount=next_td["discount"].squeeze(-1),
             done=terminated | truncated, cut=cut, valid=td["step_count"].squeeze(-1) > 1,
         )
@@ -452,12 +459,12 @@ class FlashSACVelFinetune(FlashSACVel):
                 "is_init", "adapt_hx", "depth_hx"]
         step = td.select(*keys)
         # Frozen teacher labels are computed per step; retain only the short rollout.
-        raw = self.replay_obs(td)
-        step[PRIV_FEATURE_KEY] = self.actor.encode_priv(raw)
+        step[PRIV_FEATURE_KEY], step["_teacher_action"] = self._perception_labels(td)
         if self.cfg.cycle_mode:
             self._record_perception_error(td, target=step[PRIV_FEATURE_KEY])
-        mean, _ = self.actor.get_mean_and_std(raw, training=False)
-        step["_teacher_action"] = self._joint_action(torch.tanh(mean), td)
+        if self.reuse_rollout_predictions and self.stage == 2:
+            # Command/policy are already stored; cache only the deployed EMA latent.
+            step["_rollout_priv_pred"] = td[PRIV_PRED_KEY].detach()
         if self._adapt_t == 0:
             n, t = step.shape[0], self.cfg.train_every
             self._adapt_buffer = TensorDict(
@@ -468,6 +475,19 @@ class FlashSACVelFinetune(FlashSACVel):
         if self._adapt_t == self.cfg.train_every:
             self._pending_adapt, self._adapt_buffer, self._adapt_t = self._adapt_buffer, None, 0
             self._perception_iteration_ready = True
+
+    def _teacher_labels(self, raw):
+        # Privileged targets and teacher actions share the same encoding.
+        feature = self.actor.encode_priv(raw)
+        inputs = torch.cat([self.actor.field(raw, self.actor.command_key),
+                            self.actor.field(raw, OBS_KEY), feature], dim=-1)
+        mean, _ = self.actor.policy.get_mean_and_std(inputs, training=False)
+        return feature, torch.tanh(mean)
+
+    def _perception_labels(self, td):
+        feature, mean_action = self._label_teacher(self.replay_obs(td))
+        # Own compiled outputs before the next teacher call reuses its storage.
+        return feature.clone(), self._joint_action(mean_action.clone(), td)
 
     def _student_replay_obs(self, td, latent):
         return torch.cat([self.replay_obs(td), td[VEL_CMD_KEY], latent], dim=-1)
@@ -547,11 +567,47 @@ class FlashSACVelFinetune(FlashSACVel):
             self.cycles_completed += 1
             self._start_perception()
 
+    @torch.no_grad()
+    def _prepare_perception_cache(self, rollout, distill_actor):
+        # The EMA changes only after all perception epochs. Compute its recurrent
+        # sequence outputs once, with the original initial hidden states/reset masks.
+        # Do not substitute single-step rollout predictions for warmup BC inputs.
+        rollout.pop("_perception_ema_latent", None)
+        rollout.pop("_monitor_action_squared_error", None)
+        if self.cfg.adapt_epochs <= 1:
+            return
+        collected = not distill_actor and "_rollout_priv_pred" in rollout.keys()
+        latents = (rollout["_rollout_priv_pred"] if collected else
+                   rollout[PRIV_FEATURE_KEY].new_empty(*rollout.batch_size, self.cfg.latent_dim))
+        errors = torch.empty_like(rollout["_teacher_action"]) if not distill_actor else None
+        width = rollout.shape[0] // self.cfg.adapt_num_minibatches
+        for start in range(0, rollout.shape[0], width):
+            batch = rollout[start:start + width]
+            if not collected:
+                # New TensorDict metadata keeps temporary predictions out of the
+                # rollout; all original input tensors remain read-only.
+                perception = batch.select(OBS_KEY, VEL_CMD_KEY, DEPTH_KEY,
+                                          "is_init", "adapt_hx", "depth_hx")
+                self._perceive(perception, ema=True)
+                latents[start:start + width] = perception[PRIV_PRED_KEY]
+            if errors is not None:
+                inputs = torch.cat([batch[VEL_CMD_KEY], batch[OBS_KEY],
+                                    latents[start:start + width]], dim=-1).flatten(0, 1)
+                mean, _ = self.actor_adapt.get_mean_and_std(inputs, training=False)
+                action = self._joint_action(
+                    torch.tanh(mean).reshape(*batch.batch_size, self.action_dim), batch)
+                errors[start:start + width] = (action - batch["_teacher_action"]).square()
+        if not collected:
+            rollout["_perception_ema_latent"] = latents
+        if errors is not None:
+            rollout["_monitor_action_squared_error"] = errors
+
     @set_recurrent_mode(True)
     def _train_perception(self, rollout, *, distill_actor=None):
         # rollout already holds the teacher labels PRIV_FEATURE_KEY and _teacher_action.
         if distill_actor is None:
             distill_actor = not self.is_repeated_perception_phase
+        self._prepare_perception_cache(rollout, distill_actor)
         infos = []
         for _ in range(self.cfg.adapt_epochs):
             for batch in make_batch(rollout, self.cfg.adapt_num_minibatches, self.cfg.train_every):
@@ -565,11 +621,24 @@ class FlashSACVelFinetune(FlashSACVel):
                 (priv_loss + object_loss).backward()
                 nn.utils.clip_grad_norm_(self._perception_parameters(), self.cfg.max_grad_norm)
                 self.opt_adapt.step()
-                # Distill on the rollout perception (EMA), which will be frozen for SAC.
-                # This also keeps the actor loss completely separate from perception gradients.
-                with torch.no_grad():
-                    self._perceive(batch, ema=True)
-                inputs = self._actor_adapt_input(batch).flatten(0, 1).detach()
+                # All cached values are detached. Warmup actor BC still updates on
+                # every minibatch; only the fixed EMA inputs are reused across epochs.
+                monitor_error = (batch.get("_monitor_action_squared_error", None)
+                                 if not distill_actor else None)
+                if monitor_error is not None:
+                    inputs = None
+                elif "_perception_ema_latent" in batch.keys():
+                    inputs = torch.cat([batch[VEL_CMD_KEY], batch[OBS_KEY],
+                                        batch["_perception_ema_latent"]], dim=-1).flatten(0, 1)
+                elif not distill_actor and "_rollout_priv_pred" in batch.keys():
+                    # Monitoring needs no second depth/GRU inference: use the inputs
+                    # that actually produced the rollout, with the current SAC actor.
+                    inputs = torch.cat([batch[VEL_CMD_KEY], batch[OBS_KEY],
+                                        batch["_rollout_priv_pred"]], dim=-1).flatten(0, 1)
+                else:
+                    with torch.no_grad():
+                        self._perceive(batch, ema=True)
+                    inputs = self._actor_adapt_input(batch).flatten(0, 1).detach()
                 info = {
                     "adapt/priv_loss": priv_loss.detach(), "adapt/object_loss": object_loss.detach(),
                     "adapt/priv_feature_norm": batch[PRIV_FEATURE_KEY].norm(dim=-1).mean().detach(),
@@ -579,10 +648,12 @@ class FlashSACVelFinetune(FlashSACVel):
                 if not distill_actor:
                     # Leave actor updates to SAC; only monitor distance from the teacher here.
                     with torch.no_grad():
-                        student_mean, _ = self.actor_adapt.get_mean_and_std(inputs, training=False)
-                        student_action = self._joint_action(
-                            torch.tanh(student_mean).reshape(*batch.batch_size, self.action_dim), batch)
-                        mse = ((student_action - batch["_teacher_action"]).square() * valid).mean()
+                        if monitor_error is None:
+                            student_mean, _ = self.actor_adapt.get_mean_and_std(inputs, training=False)
+                            student_action = self._joint_action(
+                                torch.tanh(student_mean).reshape(*batch.batch_size, self.action_dim), batch)
+                            monitor_error = (student_action - batch["_teacher_action"]).square()
+                        mse = (monitor_error * valid).mean()
                     info["adapt/teacher_student_action_rmse"] = mse.sqrt()
                     infos.append(info)
                     continue

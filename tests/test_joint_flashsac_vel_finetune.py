@@ -1,6 +1,7 @@
 """Real-model CPU checks for joint perception/SAC updates and checkpoint restore."""
 import copy
 import unittest
+from unittest.mock import patch
 
 import torch
 from hydra import compose, initialize
@@ -161,6 +162,57 @@ class JointFinetuneTest(unittest.TestCase):
         self.policy.load_state_dict(self.teacher_state)
         self.joint_iteration()
         self.assertEqual(self.policy.joint_perception_iters_completed, 1)
+
+    def test_teacher_labels_encode_once_and_match_original(self):
+        p = self.policy
+        td = p.get_rollout_policy("train")(self.observation())
+        with torch.no_grad():
+            raw = p.replay_obs(td)
+            feature = p.actor.encode_priv(raw)
+            mean, _ = p.actor.get_mean_and_std(raw, training=False)
+            expected = feature, p._joint_action(torch.tanh(mean), td)
+            with (patch.object(p.actor, "encode_priv", wraps=p.actor.encode_priv) as encoder,
+                  patch.object(p.actor.policy, "get_mean_and_std",
+                               wraps=p.actor.policy.get_mean_and_std) as teacher):
+                actual = p._perception_labels(td)
+                self.assertEqual(encoder.call_count, 1)
+                self.assertEqual(teacher.call_count, 1)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_joint_rollout_does_not_build_unused_current_replay_rows(self):
+        p = self.policy
+        with patch.object(p, "_student_replay_obs", wraps=p._student_replay_obs) as pack:
+            self.joint_step()
+            self.assertEqual(pack.call_count, 2)  # First current state + next state.
+            pack.reset_mock()
+            self.joint_step()
+            self.assertEqual(pack.call_count, 1)  # Only next state is inserted later.
+        with patch.object(p, "_record_perception_error", wraps=p._record_perception_error) as monitor:
+            self.joint_step()
+            self.assertEqual(monitor.call_count, 0)  # No adaptive-cycle measurement in joint.
+
+    def test_perception_updates_unchanged_without_redundant_ema_inference(self):
+        p = self.policy
+        reference = self.new_policy(adapt_epochs=2)
+        reference.load_state_dict(copy.deepcopy(p.state_dict()))
+        p.cfg.adapt_epochs = 2
+        with patch.object(p, "update"):
+            self.joint_iteration()
+        rollout = p._pending_adapt.clone()
+        uncached = rollout.exclude("_rollout_priv_pred").clone()
+        torch.manual_seed(31)
+        expected = reference._train_perception(uncached, distill_actor=False)
+        torch.manual_seed(31)
+        with patch.object(p, "_perceive", wraps=p._perceive) as perceive:
+            actual = p._train_perception(rollout, distill_actor=False)
+            self.assertEqual(perceive.call_count, p.cfg.adapt_epochs * p.cfg.adapt_num_minibatches)
+            self.assertTrue(all(not call.kwargs["ema"] for call in perceive.call_args_list))
+        for key in ("adapt/priv_loss", "adapt/object_loss"):
+            torch.testing.assert_close(actual[key], expected[key], rtol=0, atol=0)
+        for pair, expected_pair in zip(p._perception_pairs(), reference._perception_pairs()):
+            for model, old in zip(pair, expected_pair):
+                self.assert_model_equal(model, old.state_dict())
+        torch.testing.assert_close(p.opt_adapt.state_dict(), reference.opt_adapt.state_dict(), rtol=0, atol=0)
 
 
 if __name__ == "__main__":

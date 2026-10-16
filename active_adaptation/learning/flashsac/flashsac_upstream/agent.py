@@ -228,7 +228,8 @@ def _sample_flashsac_actions(
     cur_count: torch.Tensor,
     cur_n: torch.Tensor,
     zeta_cdf: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    return_mean_action: bool = False,
+) -> tuple[torch.Tensor, ...]:
     """Sample actions with noise repeat logic fully in torch."""
     # forward actor → distribution mean and std
     mean, std = actor.apply(
@@ -239,6 +240,8 @@ def _sample_flashsac_actions(
     # return deterministic actions without changing noise sampling params
     if temperature == 0.0:
         actions = torch.tanh(mean)
+        if return_mean_action:
+            return noise, actions, cur_count, cur_n, actions.clone()
         return noise, actions, cur_count, cur_n
 
     # reinit noise after a certain number of steps (only during training)
@@ -254,6 +257,9 @@ def _sample_flashsac_actions(
     # sample action
     actions = torch.tanh(mean + std * noise * temperature)
 
+    if return_mean_action:
+        # Preserve the deterministic action before another compiled actor call.
+        return noise, actions, cur_count + 1, cur_n, torch.tanh(mean.float()).clone()
     return noise, actions, cur_count + 1, cur_n
 
 

@@ -12,6 +12,7 @@ __all__ = [
     "cosil_flashsac_vel_finetune",
     "tgrl_flashsac_vel_finetune",
     "gaddpg_cosil_flashsac_vel_finetune",
+    "dagger_cosil_joint_flashsac_vel_finetune",
     "finetune_schedule",
     "flashsac_upstream",
 ]

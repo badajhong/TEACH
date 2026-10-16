@@ -311,6 +311,16 @@ still required (the full requirement while perception is running), and
 that produced the error, including at phase boundaries.
 Evaluation uses the student path (EMA perception + actor_adapt), including Stage 1 checkpoints.
 
+Teacher perception labels and actions share one privileged-encoder forward. During
+multi-epoch perception updates, EMA weights stay fixed until the end, so recurrent EMA
+latents are computed once in minibatch-sized chunks and reused across epochs. The
+initial hidden states and reset masks remain the same as the original sequence forward;
+warmup BC still updates its actor on every minibatch. Refresh actor diagnostics can also
+be cached because that actor is frozen. Caches are rebuilt every iteration and are not
+checkpointed. At the default two epochs/eight minibatches, EMA sequence forwards fall
+from 16 to 8; refresh monitoring actor forwards also fall from 16 to 8. Adaptive error
+measurements, phase decisions, SAC update counts and terminal bootstrapping are unchanged.
+
 Version 9 finetune checkpoints preserve the phase, counters, depth models, EMA, optimizer
 states, adaptive reference, initial-reference pending status, measurement windows and patience counters. The original adaptive
 learning-rate clock and horizon are preserved on resume, even when the invocation frame budget
@@ -354,6 +364,16 @@ its EMA. Actor and critic updates use the existing FlashSAC losses. The teacher
 remains fixed; the joint actor receives no additional behavior-cloning update.
 SAC gradients do not flow through stored latents into perception.
 
+Teacher latent and action labels share one privileged-encoder forward. During joint
+training, action-error monitoring reuses the actual rollout EMA latent instead of
+running EMA depth/GRUs again for each perception minibatch. Thus
+`adapt/teacher_student_action_rmse` measures the current actor on collected perception
+inputs; the perception/SAC training losses are unchanged. Only that latent is added
+to the short rollout buffer, without duplicating its command/policy tensors.
+Current replay observations are packed only for the first insertion; subsequent
+rows already have the preceding next observation. Next-state EMA inference remains
+necessary for terminal/truncation bootstrapping and changing perception weights.
+
 There are no cycle, trigger, plateau or final-SAC-tail options. Perception stays
 trainable throughout SAC, with no phase resets of replay or recurrent states.
 Collected latents and hidden states are used as-is, without recomputing them after
@@ -373,13 +393,42 @@ both perception and SAC optimizer states and resume with empty replay; their
 method is distinct from alternating finetune checkpoints. Start from a
 `flashsac_vel` teacher checkpoint or resume a joint checkpoint.
 
-CoSIL variant (`algo=cosil_flashsac_vel_finetune`, self-contained copy of this flow). It follows
+CoSIL variant (`algo=cosil_flashsac_vel_finetune`) shares the configuration and phase scheduler
+of `flashsac_vel_finetune`. With `algo.cycle_mode=true` (default), initial teacher perception
+training goes directly into student SAC; later refreshes use the same RMSE trigger,
+SAC min/max lengths, plateau checks and perception min/max lengths. `final_sac_iters`
+works only in adaptive mode, including finishing a current refresh before the final SAC
+tail. `algo.cycle_mode=false` uses `perception_iters`, `sac_iters`, `num_cycles`,
+`cycle_perception_iters` and `cycle_sac_iters`. The `finetune/*` schedule logs are shared too.
+
+It follows
 CoSIL (Nguyen et al., CoRL 2022) and regularizes the student SAC actor toward the frozen teacher
 with `D(s,h) = sum_j (tanh m_teacher,j(s) - tanh m_student,j(h))^2` and an adaptive `beta`:
 the critic target subtracts `beta*D(s',h')`, the actor loss adds `beta*D(s,h)`, and
 `beta` minimizes `beta*(target_divergence - E[D])`. `algo.cosil_mode=cosil` replaces FlashSAC's
 entropy term with this penalty (paper); `cosil_entropy` (default) keeps the entropy term and adds it.
-Defaults: `algo.target_divergence=0.5`, `algo.beta_init=0.1`.
+Defaults: `algo.target_divergence=0.8`, `algo.beta_init=0.01`. These losses run during
+SAC phases; perception refreshes retain beta and its optimizer/scheduler state. Checkpoints
+save both the shared schedule and CoSIL state.
+
+`algo.cosil_divergence_input=student` uses the replayed perception latent for
+the student side of the divergence. `algo.cosil_divergence_input=teacher` (default) uses the
+frozen teacher encoder's latent instead, keeping the student's velocity command and policy
+observations. This applies to the actor penalty, beta update and next-state critic penalty.
+Rollouts and SAC Q/entropy calculations continue to use student perception. The extra
+teacher-latent actor branch keeps BatchNorm statistics fixed while allowing actor gradients;
+the teacher encoder remains frozen and is evaluated once for the current/next minibatch.
+Teacher mode therefore measures actor disagreement given an ideal latent, rather than the
+disagreement caused by the deployed perception model. `cosil/divergence_uses_teacher_latent`
+logs the selection (1 for teacher, 0 for student). Checkpoints record it; an explicit change
+on resume uses the current config and prints a warning.
+
+Old CoSIL CLI names are now `perception_iters` (formerly `perception_warmup_iters`),
+`sac_iters` (`rl_phase_iters`), `cycle_perception_iters` (`cycle_warmup_iters`), and
+`cycle_sac_iters` (`cycle_rl_phase_iters`). Existing fixed-cycle CoSIL checkpoints are
+translated on load; use `algo.cycle_mode=false` to retain their fixed schedule. Repeated
+refreshes now always use the frozen student. For an old `cycle_warmup_mode=original` run,
+resume a SAC-phase checkpoint rather than a checkpoint inside a repeated teacher phase.
 
 TGRL variant (`algo=tgrl_flashsac_vel_finetune`, self-contained copy of this flow). It follows
 TGRL (Shenfeld et al., ICML 2023). SAC phases train two students on one replay: the exported
@@ -415,6 +464,67 @@ difference from that baseline. What changes is the SAC rollout:
 - During SAC, `train/stats/*` and the env reward EMAs are computed from the pure-student envs
   only. The intervention is logged under `gaddpg/*`. GA-DDPG (Wang et al., CoRL 2021) mixes expert
   data into replay. This variant instead uses the teacher online, as an intervening controller.
+
+Joint perception + CoSIL + teacher intervention
+(`algo=dagger_cosil_joint_flashsac_vel_finetune`):
+
+```bash
+python scripts/train.py \
+  algo=dagger_cosil_joint_flashsac_vel_finetune \
+  task=G1/vaic/skateboard_general_tracking_stu \
+  checkpoint_path=/path/to/teacher/checkpoint_3000.pt
+```
+
+- Starts joint training immediately (`perception_iters=0`). There are no public cycle,
+  `sac_iters`, plateau, or final-SAC controls. An optional `perception_iters>0` gives a single
+  teacher warmup before joint training. Perception trains while replay fills; SAC starts when
+  the replay is ready. Thereafter both continue, without phase resets or replay clearing.
+- Owns its config, rollout, teacher intervention, perception updates, CoSIL losses,
+  intervention-aware replay and checkpoint handling in `dagger_cosil_joint_flashsac_vel_finetune.py`.
+  It inherits only the generic `FlashSACVel` implementation; it does not import or inherit
+  the GADDPG or plain-joint finetune implementations. Losses and defaults remain unchanged:
+  `cosil_mode=cosil_entropy`,
+  `target_divergence=0.8`, `beta_init=0.01`, and the intervention settings listed above.
+  The actor receives CoSIL regularization, with no extra behavior-cloning optimizer steps
+  during joint training. This is a DAgger-style variant, not vanilla DAgger.
+  [DAgger](https://proceedings.mlr.press/v15/ross11a.html) aggregates expert labels on
+  learner-visited states for supervised policy learning; here online teacher labels and
+  aggregated replay are combined with CoSIL/SAC and divergence-triggered interventions.
+  This is not a reproduction of the goal-auxiliary DDPG method in
+  [GA-DDPG](https://sites.google.com/view/gaddpg/home).
+- Online perception learns privileged-feature and object labels on the latest short depth/GRU
+  rollout, including both mixed and pure-student envs. EMA perception keeps updating for
+  rollout actions. Long SAC replay stores historical latents, **not depth images**; those
+  latents and carried hidden states are not recomputed when perception changes, as in
+  `joint_flashsac_vel_finetune`. SAC gradients do not update perception through replay.
+- `train/*` episode metrics come from pure-student envs during joint training; evaluation
+  never intervenes. Monitor `adapt/*`, `cosil/*`, `dagger/takeover_rate`, `dagger/target_rate`,
+  `dagger/tau`, and `finetune/joint_perception_iters_completed`. Intervention counters include
+  the initial replay-fill iterations, matching GADDPG's convention.
+- Reuses sampled student means and teacher outputs within each rollout step. Teacher latent
+  labels and takeover actions share a single encoder/policy forward. Action-error monitoring
+  uses the stored rollout EMA latent rather than rerunning EMA depth/GRUs on each minibatch;
+  `adapt/teacher_student_action_rmse` therefore measures the current actor on actual rollout
+  perception inputs. Only the latent is cached in the short rollout; command/policy tensors
+  are not duplicated. Critic-only CoSIL updates evaluate the teacher on next states only.
+  Perception/SAC losses, takeover rules and hyperparameters are unchanged.
+- When perception has multiple epochs, cache the actor's elementwise action errors once
+  per rollout, in minibatch-sized chunks. The actor and collected inputs stay fixed during
+  those epochs; the same errors can be reduced with each original shuffled minibatch/mask.
+  At the default two epochs/eight minibatches, monitoring actor forwards fall from 16 to 8.
+  This temporary cache is rebuilt after every rollout/SAC update and is not used for BC.
+  With replay ready, the defaults still perform 256 critic, 128 actor, 128 beta and 128
+  entropy-temperature updates per training iteration (`32 * 8` SAC updates, actor period 2),
+  plus 16 perception optimizer steps (`2 * 8`). Teacher and EMA receive no gradient steps,
+  and the separate warmup BC optimizer is inactive during joint training.
+- Joint logs, intervention flags and checkpoint keys use `dagger` names. Older joint
+  checkpoints with `gaddpg_*` intervention keys still load. The separate `gaddpg` module and
+  its original algorithm registration remain available for existing cycle-based runs.
+- Accepts a FlashSAC teacher checkpoint or its own joint checkpoint. Resume restores both
+  optimizers, perception/EMA, CoSIL beta, takeover threshold and decay progress; replay and
+  recurrent rollout state start fresh. Other finetune variants' checkpoints are rejected.
+  Buffer size is unchanged from the existing variants; use `algo.buffer_max_length=8000000`
+  if the default 10-million-row CPU replay exceeds available RAM.
 
 Teacher policy with PPO on the FlashSAC observation
 

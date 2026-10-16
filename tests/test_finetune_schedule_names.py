@@ -9,6 +9,9 @@ from omegaconf import OmegaConf
 from active_adaptation.learning.flashsac.flashsac_vel_finetune import (
     FlashSACVelFinetune, FlashSACVelFinetuneConfig,
 )
+from active_adaptation.learning.flashsac.cosil_flashsac_vel_finetune import (
+    CoSILFlashSACVelFinetune, CoSILFlashSACVelFinetuneConfig,
+)
 from active_adaptation.learning.flashsac.gaddpg_cosil_flashsac_vel_finetune import (
     GADDPGCoSILFlashSACVelFinetune, GADDPGCoSILFlashSACVelFinetuneConfig,
 )
@@ -21,6 +24,7 @@ class ScheduleNamesTest(unittest.TestCase):
     def test_config_overrides_cycles_and_checkpoint_warnings(self):
         for policy, config in (
             (FlashSACVelFinetune, FlashSACVelFinetuneConfig),
+            (CoSILFlashSACVelFinetune, CoSILFlashSACVelFinetuneConfig),
             (GADDPGCoSILFlashSACVelFinetune, GADDPGCoSILFlashSACVelFinetuneConfig),
             (TGRLFlashSACVelFinetune, TGRLFlashSACVelFinetuneConfig),
         ):
@@ -28,7 +32,7 @@ class ScheduleNamesTest(unittest.TestCase):
                 values = dict(perception_iters=2, sac_iters=3,
                               cycle_perception_iters=4, cycle_sac_iters=5)
                 cfg = OmegaConf.merge(OmegaConf.structured(config), values)
-                if policy is FlashSACVelFinetune:
+                if issubclass(policy, FlashSACVelFinetune):
                     cfg.cycle_mode = False
                 p = SimpleNamespace(cfg=cfg, cycles_completed=0)
                 self.assertEqual(policy._perception_length(p), 2)

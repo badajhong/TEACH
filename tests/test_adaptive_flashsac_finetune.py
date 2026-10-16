@@ -19,6 +19,8 @@ from active_adaptation.learning.flashsac.flashsac_vel_finetune import (
 
 
 class AdaptiveFinetuneTest(unittest.TestCase):
+    config_cls = FlashSACVelFinetuneConfig
+    policy_cls = FlashSACVelFinetune
     # Reuse only the fixture helpers, not its legacy-schedule test methods.
     setUp = fixtures.FinetuneTest.setUp
     tearDown = fixtures.FinetuneTest.tearDown
@@ -39,8 +41,8 @@ class AdaptiveFinetuneTest(unittest.TestCase):
             num_cycles=0, sac_iters=1000,
         )
         schedule.update(overrides)
-        cfg = FlashSACVelFinetuneConfig(**{**self.options, **schedule})
-        return FlashSACVelFinetune(cfg, self.spec, self.action_spec, None, "cpu", self.env)
+        cfg = self.config_cls(**{**self.options, **schedule})
+        return self.policy_cls(cfg, self.spec, self.action_spec, None, "cpu", self.env)
 
     def finish_teacher(self):
         self.perception_iteration()

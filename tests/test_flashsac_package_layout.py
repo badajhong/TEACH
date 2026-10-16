@@ -23,6 +23,8 @@ ALGORITHMS = (
     ("cosil_flashsac_vel_finetune", "cosil_flashsac_vel_finetune", "CoSILFlashSACVelFinetune"),
     ("gaddpg_cosil_flashsac_vel_finetune", "gaddpg_cosil_flashsac_vel_finetune",
      "GADDPGCoSILFlashSACVelFinetune"),
+    ("dagger_cosil_joint_flashsac_vel_finetune", "dagger_cosil_joint_flashsac_vel_finetune",
+     "DAggerCoSILJointFlashSACVelFinetune"),
     ("tgrl_flashsac_vel_finetune", "tgrl_flashsac_vel_finetune", "TGRLFlashSACVelFinetune"),
 )
 

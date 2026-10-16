@@ -154,18 +154,20 @@ def _check_ram(nbytes: int, rows: int, reserve: int = 4 * 2**30):
 class InterventionNStepReplay:
     """flashsac_vel_flat.NStepTrajectoryReplay plus a per-row teacher-intervention flag.
 
-    Yields the same transitions as upstream `TorchUniformBuffer`: rows are drawn uniformly
-    with replacement, and the n-step return stops at the first episode end and bootstraps
-    from that step's next observation. Each observation is stored once, in per-env time
-    order, so the next observation of row t is the one in slot t+1.
+    Rows are drawn uniformly with replacement. The n-step return stops at the first
+    episode end and, unless bootstrap is cut, uses that step's next observation with
+    the discount for the actual number of rewards collected. Each observation is stored
+    once, in per-env time order, so the next observation of row t is the one in slot t+1.
 
     VAIC does not recompute observations on reset, so on the step after a reset the env
     carries a placeholder observation. That slot is filled with the true final observation
     of the finished episode instead, and the row itself is never sampled.
 
     The window of row t also stops before the first step t+k (k >= 1) whose action was the
-    teacher's and bootstraps from s_{t+k}. The critic target discounts the bootstrap by
-    gamma^n, so `terminated` is set to 1 - gamma^(k - n) (negative) to make it gamma^k.
+    teacher's and bootstraps from s_{t+k}. The critic target always multiplies by gamma^n,
+    so for a window shortened to m rewards, `1 - terminated` encodes gamma^(m - n) times
+    the product of the env discounts. `terminated` may therefore be negative. A terminal
+    cut still sets it to 1, disabling bootstrap.
 
     Observations may be stored in a lower precision (`obs_dtype`); sampled batches are float32.
     With `storage_device="cpu"` the data lives in RAM and each batch is gathered into pinned
@@ -293,7 +295,10 @@ class InterventionNStepReplay:
             scale = torch.where(alive, scale * self.discount[tk, env], scale)
             ends = alive & done
             next_t = torch.where(ends, (tk + 1) % T, next_t)
-            cont = torch.where(ends, scale * ~self.cut[tk, env], cont)
+            # This end follows k+1 rewards. Compensate for the critic's fixed
+            # gamma^n so truncations bootstrap with gamma^(k+1), not gamma^n.
+            end_cont = scale * ~self.cut[tk, env] * self.gamma ** (k + 1 - self.n_step)
+            cont = torch.where(ends, end_cont, cont)
             alive = alive & ~done
         cont = torch.where(alive, scale, cont)
 
@@ -350,7 +355,7 @@ class GADDPGFinetuneRollout(TensorDictModuleBase):
     def forward(self, td):
         p = self.policy
         if not p._checkpoint_loaded:
-            raise RuntimeError("gaddpg_cosil_flashsac_vel_finetune requires checkpoint_path to a teacher or finetune checkpoint")
+            raise RuntimeError(f"{p.cfg.name} requires checkpoint_path to a teacher or finetune checkpoint")
         if ACTION_DR_KEY in p.replay_keys:
             td[ACTION_DR_KEY] = p.action_dr()
         p._perceive(td, ema=True)
@@ -362,16 +367,20 @@ class GADDPGFinetuneRollout(TensorDictModuleBase):
             observation = p._actor_adapt_input(td)
         if self.train_mode:
             # Even with an empty replay, sample the warm-start policy (never uniform actions).
-            p._cached_noise, u, p._cur_noise_repeat_count, p._cur_noise_repeat_n = (
+            reuse_mean = p.reuse_rollout_predictions and p.stage == 2
+            sampled = (
                 _sample_flashsac_actions(
                     actor=network, noise=p._cached_noise, observations=observation,
                     temperature=p._rollout_noise_scale(teacher_rollout),
                     cur_count=p._cur_noise_repeat_count,
                     cur_n=p._cur_noise_repeat_n, zeta_cdf=p._zeta_cdf,
+                    return_mean_action=reuse_mean,
                 )
             )
+            p._cached_noise, u, p._cur_noise_repeat_count, p._cur_noise_repeat_n = sampled[:4]
             if p.stage == 2:
-                u = p._intervene(td, observation, u)
+                u = p._intervene(td, observation, u,
+                                 student_mean_action=sampled[4] if reuse_mean else None)
         else:
             mean, _ = network.apply("get_mean_and_std", observation, training=False)
             u = torch.tanh(mean)
@@ -381,6 +390,11 @@ class GADDPGFinetuneRollout(TensorDictModuleBase):
 
 
 class GADDPGCoSILFlashSACVelFinetune(FlashSACVel):
+    intervention_prefix = "gaddpg"
+    intervention_label = "GA-DDPG"
+    intervened_key = INTERVENED_KEY
+    reuse_rollout_predictions = False
+
     def __init__(self, cfg, observation_spec, action_spec, reward_spec, device, env):
         if cfg.perception_iters < 0 or cfg.adapt_epochs < 1:
             raise ValueError("perception_iters must be >= 0 and adapt_epochs >= 1")
@@ -409,7 +423,7 @@ class GADDPGCoSILFlashSACVelFinetune(FlashSACVel):
         if not 0 < cfg.perception_ema_tau <= 1:
             raise ValueError("perception_ema_tau must be in (0, 1]")
         if cfg.adapt_module != "gru" or not cfg.use_object_adapt:
-            raise ValueError("gaddpg_cosil_flashsac_vel_finetune requires GRU and object adaptation")
+            raise ValueError(f"{cfg.name} requires GRU and object adaptation")
         if not cfg.enable_residual_distillation:
             raise ValueError("Stage 1 requires enable_residual_distillation=true")
         if observation_spec.get(DEPTH_KEY, None) is None:
@@ -441,10 +455,7 @@ class GADDPGCoSILFlashSACVelFinetune(FlashSACVel):
             *range(policy_start, policy_end),
             *range(self.replay_obs_dim + self.vel_command_dim, self.student_replay_dim),
         ], device=self.device)
-        print(f"[FlashSAC finetune] first cycle: perception phase {cfg.perception_iters} + SAC "
-              f"{cfg.sac_iters} iterations; then {cfg.num_cycles} x (perception phase "
-              f"{cfg.cycle_perception_iters} + SAC {cfg.cycle_sac_iters}) "
-              f"student replay {self.student_replay_dim}, critic input {self.obs_dim} dims.")
+        self._print_training_schedule()
         if cfg.cosil_mode == "entropy":
             print("[CoSIL] mode entropy: no CoSIL term, FlashSAC's own update.")
         else:
@@ -462,10 +473,20 @@ class GADDPGCoSILFlashSACVelFinetune(FlashSACVel):
         self._intervention_sums = torch.zeros(4, device=self.device)
         self._intervention_info = {}
         getattr(self.env, "base_env", self.env).stats_env_mask = None
-        print(f"[GA-DDPG] {int(self._mixed_envs.sum())}/{self.num_envs} mixed envs, target rate "
+        print(f"[{self.intervention_label}] {int(self._mixed_envs.sum())}/{self.num_envs} mixed envs, target rate "
               f"{cfg.intervention_rate_init} -> {cfg.intervention_rate_end} over "
               f"{cfg.intervention_decay_fraction} of {self._rl_total_iters} SAC iterations, "
               f"hold {cfg.intervention_hold_steps}, tau_init {cfg.intervention_tau_init}.")
+
+    def _print_training_schedule(self):
+        cfg = self.cfg
+        print(f"[FlashSAC finetune] first cycle: perception phase {cfg.perception_iters} + SAC "
+              f"{cfg.sac_iters} iterations; then {cfg.num_cycles} x (perception phase "
+              f"{cfg.cycle_perception_iters} + SAC {cfg.cycle_sac_iters}) "
+              f"student replay {self.student_replay_dim}, critic input {self.obs_dim} dims.")
+
+    def _training_progress_summary(self):
+        return f"repeated cycles={self.cycles_completed}/{self.cfg.num_cycles}"
 
     @property
     def is_repeated_perception_phase(self):
@@ -508,15 +529,18 @@ class GADDPGCoSILFlashSACVelFinetune(FlashSACVel):
         progress = min(1.0, self.sac_iters_completed / horizon) if horizon > 0 else 1.0
         return cfg.intervention_rate_init + (cfg.intervention_rate_end - cfg.intervention_rate_init) * progress
 
-    def _intervene(self, td, observation, u):
+    def _intervene(self, td, observation, u, *, student_mean_action=None, teacher_mean_action=None):
         """Replace the student's sampled action with the teacher's mean where a takeover runs."""
         takeover = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         if self._intervention_target() > 0:
             # clone() each compiled output before the next CUDA graph replay can overwrite it
-            student_mean, _ = self._student.apply("get_mean_and_std", observation, training=False)
-            u_student = torch.tanh(student_mean.float()).clone()
-            teacher_mean, _ = self._actor.apply("get_mean_and_std", self.replay_obs(td), training=False)
-            u_teacher = torch.tanh(teacher_mean.float()).clone()
+            if student_mean_action is None:
+                student_mean, _ = self._student.apply("get_mean_and_std", observation, training=False)
+                student_mean_action = torch.tanh(student_mean.float()).clone()
+            if teacher_mean_action is None:
+                teacher_mean, _ = self._actor.apply("get_mean_and_std", self.replay_obs(td), training=False)
+                teacher_mean_action = torch.tanh(teacher_mean.float()).clone()
+            u_student, u_teacher = student_mean_action.float(), teacher_mean_action.float()
             divergence = (u_teacher - u_student).square().sum(-1)
             hold = self._hold_left.masked_fill(td["is_init"].squeeze(-1), 0)
             trigger = self._mixed_envs & (divergence > self.intervention_tau)
@@ -527,7 +551,7 @@ class GADDPGCoSILFlashSACVelFinetune(FlashSACVel):
             mixed = self._mixed_envs.float()
             self._intervention_sums += torch.stack([
                 takeover.float().sum(), trigger.float().sum(), (divergence * mixed).sum(), mixed.sum()])
-        td[INTERVENED_KEY] = takeover
+        td[self.intervened_key] = takeover
         return u
 
     def _update_intervention(self):
@@ -538,13 +562,15 @@ class GADDPGCoSILFlashSACVelFinetune(FlashSACVel):
         if steps > 0:
             rate = takeover / steps
             self._intervention_info = {
-                "gaddpg/takeover_rate": rate, "gaddpg/trigger_rate": trigger / steps,
-                "gaddpg/divergence_mixed": divergence / steps}
+                f"{self.intervention_prefix}/takeover_rate": rate,
+                f"{self.intervention_prefix}/trigger_rate": trigger / steps,
+                f"{self.intervention_prefix}/divergence_mixed": divergence / steps}
             if target > 0:
                 tau = self.intervention_tau * math.exp(self.cfg.intervention_tau_lr * (rate - target))
                 self.intervention_tau = min(max(tau, 1e-3), 1e3)
         else:
-            self._intervention_info = {"gaddpg/takeover_rate": 0.0, "gaddpg/trigger_rate": 0.0}
+            self._intervention_info = {f"{self.intervention_prefix}/takeover_rate": 0.0,
+                                       f"{self.intervention_prefix}/trigger_rate": 0.0}
 
     def _build_adaptation(self, observation_spec):
         super()._build_adaptation(observation_spec)
@@ -619,25 +645,7 @@ class GADDPGCoSILFlashSACVelFinetune(FlashSACVel):
     @torch.no_grad()
     def add_transition(self, td):
         if self.stage == 1:
-            keys = [OBS_KEY, VEL_CMD_KEY, DEPTH_KEY, OBJECT_KEY, REF_JPOS_KEY,
-                    "is_init", "adapt_hx", "depth_hx"]
-            step = td.select(*keys)
-            # Teacher labels for _train_perception, computed per step (the teacher is frozen), so
-            # neither the full replay observation nor one large teacher call is needed later.
-            raw = self.replay_obs(td)
-            step[PRIV_FEATURE_KEY] = self.actor.encode_priv(raw)
-            mean, _ = self.actor.get_mean_and_std(raw, training=False)
-            step["_teacher_action"] = self._joint_action(torch.tanh(mean), td)
-            if self._adapt_t == 0:
-                # One [num_envs, train_every] buffer per iteration, filled in place.
-                n, t = step.shape[0], self.cfg.train_every
-                self._adapt_buffer = TensorDict(
-                    {k: torch.empty(n, t, *v.shape[1:], dtype=v.dtype, device=v.device)
-                     for k, v in step.items()}, batch_size=[n, t], device=self.device)
-            self._adapt_buffer[:, self._adapt_t] = step
-            self._adapt_t += 1
-            if self._adapt_t == self.cfg.train_every:
-                self._pending_adapt, self._adapt_buffer, self._adapt_t = self._adapt_buffer, None, 0
+            self._collect_perception_transition(td)
             return
 
         next_td = td["next"]
@@ -652,10 +660,12 @@ class GADDPGCoSILFlashSACVelFinetune(FlashSACVel):
             "adapt_hx": next_td["adapt_hx"], "depth_hx": next_td["depth_hx"],
         }, batch_size=td.batch_size, device=self.device)
         self._perceive(perception_next, ema=True)
-        current_obs = self._student_replay_obs(td, td[PRIV_PRED_KEY])
         next_obs = self._student_replay_obs(next_td, perception_next[PRIV_PRED_KEY])
         if self.buffer is None:
             self._allocate_student_replay()
+        # Later rows already hold s_t as the previous transition's next_obs.
+        current_obs = (self._student_replay_obs(td, td[PRIV_PRED_KEY])
+                       if self.buffer.step == 0 else None)
         terminated = next_td["terminated"].squeeze(-1)
         truncated = next_td["truncated"].squeeze(-1)
         cut = terminated
@@ -663,11 +673,11 @@ class GADDPGCoSILFlashSACVelFinetune(FlashSACVel):
             time_limit = next_td["step_count"].squeeze(-1) >= self.env.max_episode_length
             cut = cut | (truncated & ~time_limit)
         reward = next_td["reward"].sum(-1)
-        intervened = td.get(INTERVENED_KEY, None)
+        intervened = td.get(self.intervened_key, None)
         if intervened is None:
             intervened = torch.zeros_like(terminated)
         self.buffer.add(
-            obs=current_obs if self.buffer.step == 0 else None, next_obs=next_obs,
+            obs=current_obs, next_obs=next_obs,
             action=td[U_KEY], reward=reward, discount=next_td["discount"].squeeze(-1),
             done=terminated | truncated, cut=cut, valid=td["step_count"].squeeze(-1) > 1,
             intervened=intervened,
@@ -680,6 +690,34 @@ class GADDPGCoSILFlashSACVelFinetune(FlashSACVel):
             self.rl_phase_iters_completed += 1
             self.sac_iters_completed += 1
             self._rl_steps_in_iteration = 0
+
+    @torch.no_grad()
+    def _collect_perception_transition(self, td):
+        keys = [OBS_KEY, VEL_CMD_KEY, DEPTH_KEY, OBJECT_KEY, REF_JPOS_KEY,
+                "is_init", "adapt_hx", "depth_hx"]
+        step = td.select(*keys)
+        # Teacher labels for _train_perception, computed per step (the teacher is frozen), so
+        # neither the full replay observation nor one large teacher call is needed later.
+        step[PRIV_FEATURE_KEY], step["_teacher_action"] = self._perception_labels(td)
+        if self.reuse_rollout_predictions and self.stage == 2:
+            # Command/policy inputs are already in this buffer; only cache the latent.
+            step["_rollout_priv_pred"] = td[PRIV_PRED_KEY].detach()
+        if self._adapt_t == 0:
+            # One [num_envs, train_every] buffer per iteration, filled in place.
+            n, t = step.shape[0], self.cfg.train_every
+            self._adapt_buffer = TensorDict(
+                {k: torch.empty(n, t, *v.shape[1:], dtype=v.dtype, device=v.device)
+                 for k, v in step.items()}, batch_size=[n, t], device=self.device)
+        self._adapt_buffer[:, self._adapt_t] = step
+        self._adapt_t += 1
+        if self._adapt_t == self.cfg.train_every:
+            self._pending_adapt, self._adapt_buffer, self._adapt_t = self._adapt_buffer, None, 0
+
+    def _perception_labels(self, td):
+        raw = self.replay_obs(td)
+        feature = self.actor.encode_priv(raw)
+        mean, _ = self.actor.get_mean_and_std(raw, training=False)
+        return feature, self._joint_action(torch.tanh(mean), td)
 
     def _student_replay_obs(self, td, latent):
         return torch.cat([self.replay_obs(td), td[VEL_CMD_KEY], latent], dim=-1)
@@ -725,8 +763,15 @@ class GADDPGCoSILFlashSACVelFinetune(FlashSACVel):
             self.cycles_completed += 1
             self._start_perception()
 
+    def _prepare_perception_monitor(self, rollout, distill_actor):
+        # Subclasses may cache diagnostics when actor/inputs are fixed across epochs.
+        pass
+
     @set_recurrent_mode(True)
-    def _train_perception(self, rollout):
+    def _train_perception(self, rollout, *, distill_actor=None):
+        if distill_actor is None:
+            distill_actor = not self.is_repeated_perception_phase
+        self._prepare_perception_monitor(rollout, distill_actor)
         # rollout already holds the teacher labels PRIV_FEATURE_KEY and _teacher_action.
         infos = []
         for _ in range(self.cfg.adapt_epochs):
@@ -741,24 +786,34 @@ class GADDPGCoSILFlashSACVelFinetune(FlashSACVel):
                 (priv_loss + object_loss).backward()
                 nn.utils.clip_grad_norm_(self._perception_parameters(), self.cfg.max_grad_norm)
                 self.opt_adapt.step()
-                # Distill on the rollout perception (EMA), which will be frozen for SAC.
-                # This also keeps the actor loss completely separate from perception gradients.
-                with torch.no_grad():
-                    self._perceive(batch, ema=True)
-                inputs = self._actor_adapt_input(batch).flatten(0, 1).detach()
+                # Joint monitoring can use the actual rollout inputs. Re-running the
+                # EMA depth/GRUs adds no training signal when the actor is not distilled.
+                monitor_error = (batch.get("_monitor_action_squared_error", None)
+                                 if not distill_actor else None)
+                if monitor_error is not None:
+                    inputs = None  # This diagnostic was computed once for the whole rollout.
+                elif not distill_actor and "_rollout_priv_pred" in batch.keys():
+                    inputs = torch.cat([batch[VEL_CMD_KEY], batch[OBS_KEY],
+                                        batch["_rollout_priv_pred"]], dim=-1).flatten(0, 1)
+                else:
+                    with torch.no_grad():
+                        self._perceive(batch, ema=True)
+                    inputs = self._actor_adapt_input(batch).flatten(0, 1).detach()
                 info = {
                     "adapt/priv_loss": priv_loss.detach(), "adapt/object_loss": object_loss.detach(),
                     "adapt/priv_feature_norm": batch[PRIV_FEATURE_KEY].norm(dim=-1).mean().detach(),
                     "adapt/priv_pred_norm": priv_pred_norm,
                     "adapt/depth_feature_norm": depth_feature_norm,
                 }
-                if self.is_repeated_perception_phase:
-                    # The SAC actor stays frozen; only monitor its distance from the teacher.
+                if not distill_actor:
+                    # The actor is handled separately; only monitor its distance from the teacher.
                     with torch.no_grad():
-                        student_mean, _ = self.actor_adapt.get_mean_and_std(inputs, training=False)
-                        student_action = self._joint_action(
-                            torch.tanh(student_mean).reshape(*batch.batch_size, self.action_dim), batch)
-                        mse = ((student_action - batch["_teacher_action"]).square() * valid).mean()
+                        if monitor_error is None:
+                            student_mean, _ = self.actor_adapt.get_mean_and_std(inputs, training=False)
+                            student_action = self._joint_action(
+                                torch.tanh(student_mean).reshape(*batch.batch_size, self.action_dim), batch)
+                            monitor_error = (student_action - batch["_teacher_action"]).square()
+                        mse = (monitor_error * valid).mean()
                     info["adapt/teacher_student_action_rmse"] = mse.sqrt()
                     infos.append(info)
                     continue
@@ -780,10 +835,14 @@ class GADDPGCoSILFlashSACVelFinetune(FlashSACVel):
                     dst.lerp_(src, self.cfg.perception_ema_tau)
         return {k: torch.stack([i[k] for i in infos]).mean() for k in infos[0]}
 
-    def _start_rl(self, schedule_updates=None):
+    def _prepare_rl_perception(self):
         for pair in self._perception_pairs():
             for model in pair:
                 model.requires_grad_(False).eval()
+        return "perception and EMA frozen"
+
+    def _start_rl(self, schedule_updates=None):
+        perception_status = self._prepare_rl_perception()
         self.actor_adapt.requires_grad_(True)
         self.critic.requires_grad_(True)
         self.temperature.requires_grad_(True)
@@ -792,7 +851,7 @@ class GADDPGCoSILFlashSACVelFinetune(FlashSACVel):
         self._reset_phase_rollout()
         # Reward EMAs (env.stats_ema) and train/stats come from the pure-student envs only.
         getattr(self.env, "base_env", self.env).stats_env_mask = ~self._mixed_envs
-        print("[FlashSAC finetune] Stage 2: perception and EMA frozen; student SAC enabled. "
+        print(f"[FlashSAC finetune] Stage 2: {perception_status}; student SAC enabled. "
               "Resetting environments/hidden states; replay starts empty.")
         if self._student is not None:
             # Continue SAC optimizer/scheduler state after repeated supervised perception phase.
@@ -935,15 +994,18 @@ class GADDPGCoSILFlashSACVelFinetune(FlashSACVel):
         if network.scheduler is not None:
             network.scheduler.step()
 
+    def _cosil_teacher_actions(self, batch, do_actor_update):
+        teacher_obs = torch.cat([batch["teacher_observation"], batch["teacher_next_observation"]])
+        teacher_mean, _ = self.actor.get_mean_and_std(teacher_obs, training=False)
+        return torch.tanh(teacher_mean.float()).clone().chunk(2)
+
     def _cosil_update_networks(self, batch, do_actor_update):
         """flashsac_upstream.agent._update_networks with the CoSIL actor, beta and critic target."""
         cfg, device = self.flash_cfg, self.device
         entropy_on = self.cfg.cosil_mode == "cosil_entropy"
         student, critic, target_critic = self._student, self._critic, self._target_critic
         with torch.no_grad():  # state expert mu(s), mu(s') from the frozen teacher
-            teacher_obs = torch.cat([batch["teacher_observation"], batch["teacher_next_observation"]])
-            teacher_mean, _ = self.actor.get_mean_and_std(teacher_obs, training=False)
-            mu, mu_next = torch.tanh(teacher_mean.float()).clone().chunk(2)
+            mu, mu_next = self._cosil_teacher_actions(batch, do_actor_update)
         info = {}
         if do_actor_update:
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=cfg.use_amp):
@@ -1023,9 +1085,9 @@ class GADDPGCoSILFlashSACVelFinetune(FlashSACVel):
             info["cosil/beta_value"] = self._beta().item()
         if self.stage == 2:
             info.update(self._intervention_info)
-            info.update({"gaddpg/tau": self.intervention_tau,
-                         "gaddpg/target_rate": self._intervention_target(),
-                         "gaddpg/sac_iters_completed": self.sac_iters_completed})
+            info.update({f"{self.intervention_prefix}/tau": self.intervention_tau,
+                         f"{self.intervention_prefix}/target_rate": self._intervention_target(),
+                         f"{self.intervention_prefix}/sac_iters_completed": self.sac_iters_completed})
         return info
 
     def state_dict(self):
@@ -1055,8 +1117,8 @@ class GADDPGCoSILFlashSACVelFinetune(FlashSACVel):
             state["cosil_beta_optimizer"] = self._beta.optimizer.state_dict()
             state["cosil_beta_scheduler"] = self._beta.scheduler.state_dict()
         state["cosil_mode"] = self.cfg.cosil_mode
-        state["gaddpg_intervention_tau"] = self.intervention_tau
-        state["gaddpg_sac_iters_completed"] = self.sac_iters_completed
+        state[f"{self.intervention_prefix}_intervention_tau"] = self.intervention_tau
+        state[f"{self.intervention_prefix}_sac_iters_completed"] = self.sac_iters_completed
         return state
 
     def load_state_dict(self, state_dict, strict=True):
@@ -1111,8 +1173,10 @@ class GADDPGCoSILFlashSACVelFinetune(FlashSACVel):
             self.perception_iters_completed = state_dict["perception_iters_completed"]
             self.rl_phase_iters_completed = state_dict.get("rl_phase_iters_completed", 0)
             # A CoSIL/finetune checkpoint starts the intervention schedule fresh.
-            self.intervention_tau = state_dict.get("gaddpg_intervention_tau", self.intervention_tau)
-            self.sac_iters_completed = state_dict.get("gaddpg_sac_iters_completed", 0)
+            self.intervention_tau = state_dict.get(f"{self.intervention_prefix}_intervention_tau",
+                                                   state_dict.get("gaddpg_intervention_tau", self.intervention_tau))
+            self.sac_iters_completed = state_dict.get(f"{self.intervention_prefix}_sac_iters_completed",
+                                                      state_dict.get("gaddpg_sac_iters_completed", 0))
         elif self.cfg.perception_iters == 0:
             self._start_rl()
         if self.reward_normalizer is not None:
@@ -1124,7 +1188,7 @@ class GADDPGCoSILFlashSACVelFinetune(FlashSACVel):
         self.env.set_progress(self.finetune_iters_completed)
         print(f"[FlashSAC finetune] {'resumed' if resume else 'loaded teacher'}; "
               f"stage={self.stage}, perception phase={self.perception_iters_completed}/{self._perception_length()}, "
-              f"repeated cycles={self.cycles_completed}/{self.cfg.num_cycles}")
+              f"{self._training_progress_summary()}")
         return []
 
     def _warn_schedule_change(self, state):
