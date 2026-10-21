@@ -742,6 +742,10 @@ class random_joint_offset(Randomization):
     def reset(self, env_ids: torch.Tensor):
         offset = uniform(self.offset_range[env_ids, :, 0], self.offset_range[env_ids, :, 1])
         self.action_manager.offset[env_ids.unsqueeze(1), self.joint_ids] = offset
+        # Fixed joints hold their actual default targets, without calibration noise.
+        fixed_ids = getattr(self.action_manager, "fixed_joint_ids", [])
+        if fixed_ids:
+            self.action_manager.offset[env_ids.unsqueeze(1), fixed_ids] = 0.0
 
 
 class random_pull(Randomization):

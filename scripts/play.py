@@ -130,6 +130,7 @@ def main(cfg):
         from active_adaptation.envs.mdp.action import JointPosition
         action_manager: JointPosition = env.action_manager
         policy_config["policy_joint_names"] = action_manager.joint_names
+        policy_config["fixed_joint_names"] = action_manager.fixed_joint_names
 
         ## command
         command = env.command_manager

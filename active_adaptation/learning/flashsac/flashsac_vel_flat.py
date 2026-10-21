@@ -501,6 +501,13 @@ class FlashSACVelFlat(TensorDictModuleBase):
         self.object_transform = TransformObject(None, [OBJECT_KEY, OBJECT_GEO_KEY], [OBJECT_TRANS_KEY])
 
         self.action_dim = action_spec.shape[-1]
+        reference_dim = math.prod(observation_spec[REF_JPOS_KEY].shape[1:])
+        if reference_dim != self.action_dim:
+            raise ValueError(
+                f"{REF_JPOS_KEY} has {reference_dim} values but the robot has "
+                f"{self.action_dim} policy actions. Build reference actions from "
+                "action_manager.joint_names, excluding joints held at default targets."
+            )
         self.num_envs = observation_spec.shape[0]
         rename = lambda name: cmd_key + name[len(CMD_KEY):] if name.startswith(f"{CMD_KEY}/") else name
         future_terms = None if cfg.obs_future_terms is None else {rename(n) for n in cfg.obs_future_terms}

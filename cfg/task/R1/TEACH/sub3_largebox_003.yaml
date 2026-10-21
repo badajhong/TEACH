@@ -20,8 +20,9 @@ robot:
   robot_type: r1_26dof
 
 # Match Holosoma's effort/Kp-derived target scales.  R1 has 26 simulated DOFs,
-# but its two head joints stay locked, giving the intended 24-action policy.
+# but its two head joints hold default targets, giving a 24-action policy.
 action:
+  fixed_joint_names: [head_pitch_joint, head_yaw_joint]
   action_scaling:
     .*_hip_yaw_joint: 0.15
     .*_hip_roll_joint: 0.15

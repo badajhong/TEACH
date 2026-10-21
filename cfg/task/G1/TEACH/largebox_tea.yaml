@@ -1,0 +1,6 @@
+# @package task
+# Compatibility with the original command: this task uses the R1 robot.
+# Prefer task=R1/TEACH/largebox_tea for new runs.
+defaults:
+  - /task/R1/TEACH/largebox_tea
+  - _self_

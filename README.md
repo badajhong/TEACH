@@ -167,6 +167,71 @@ Use `algo.buffer_device_type=cuda` to keep it on the GPU instead.
 - Continue with `flashsac_vel_finetune` below to train depth perception and then freeze it
   for student SAC training.
 
+R1 largebox teacher
+
+```bash
+python scripts/train.py algo=flashsac_vel_train task=R1/TEACH/largebox_tea
+```
+
+`task=G1/TEACH/largebox_tea` is an alias for this same **R1** task, so the original
+command also works. The task uses `data/motion/r1/largebox/sub3_largebox_003` and
+the existing R1/largebox USDs under `/home/hcc/research/HOI`; set `VAIC_HOI_ROOT`
+if that checkout is elsewhere.
+
+- R1 has 26 simulated joints and **24 policy actions**. Its two head joints are
+  held at their default position targets; R1 has no waist-pitch joint. Reference
+  actions are selected in the action manager's joint order and use its R1 scales.
+  `action.fixed_joint_names` keeps head pitch/yaw at their configured defaults
+  (both 0 rad): resets replace reference/noisy head states with default positions
+  and zero velocity, offset randomization excludes them, and every physics step
+  sends the default head targets. This applies to training and `play.py` inference.
+  The head is held by its position actuators; it is not a rigidly welded joint.
+  Exported policy metadata lists the 24 `policy_joint_names`, the two
+  `fixed_joint_names`, and the default positions needed by an external controller.
+- Network sizes come from the environment specs. With this task's defaults, the
+  teacher actor reads **821 values** (331 command + 234 policy + 256 latent) and
+  outputs 24 residual actions. The critic reads **1,092 state values + 24 actions**;
+  `actor_adapt` reads 510 values. Start a new R1 run or resume an R1 checkpoint
+  with matching settings; the G1 networks have different shapes.
+- Rewards follow `G1/vaic/box_general_tracking_tea`, with R1 body/joint mappings:
+  body and joint tracking, object pose and hand contact, action/velocity/torque
+  penalties, foot impact/slip, survival, reference foot-contact matching, and
+  joint-limit weight 15 with R1 soft factor 0.95. Joint tracking sigmas match the G1
+  baseline (position 0.25, velocity 2.5).
+- Position penalties read the loaded R1 USD's joint limits; torque penalties
+  read its configured actuator effort limits (60, 50, or 33 Nm, with the penalty
+  starting at 60% of each limit). The position penalty, its debug metric, and
+  reset clipping all use a 0.95 soft position factor, following the R1 FlashSAC
+  preset in `HOI/train_r1/r1_robot/r1/reward.py`. An audit of all 525 reference
+  frames found no hard position/velocity violations beyond floating-point
+  rounding. The copied 0.8 factor penalized 56% of frames, by up to 0.424 rad
+  on one joint; 0.95 reduces that maximum to 0.013 rad. Reference poses near
+  the physical boundaries still receive a small soft-limit penalty.
+- Termination uses R1 body names but retains the shared tracking tolerances:
+  body position 0.5 m, body orientation 1.2 rad, object position 0.5 m, object
+  orientation 0.8 rad, or missing required hand contact (0.2 m / 1 N), each for
+  25 consecutive steps (0.5 s). There is no joint-limit termination. These
+  tracking tolerances and the raw action-rate/velocity penalty weights are
+  tuning choices; they do not automatically rescale with robot joint ranges.
+- Omitted: `waist_pos_limits` requires a waist-pitch joint; fixed 0.3 s foot air
+  time and 12-15 cm lift targets conflict with this clip's short asymmetric
+  swings and approximately 7-9 cm peak clearance above stance. Reference foot
+  contact and body tracking still supervise the feet. The scene contains the
+  largebox on a plane, with the existing R1 randomizations.
+- Resets sample the full clip. G1's `[0, 100]` reset range would cover only this
+  converted clip's synthetic lead-in. FlashSAC controls parallelism through
+  `algo.num_envs`, which overrides `task.num_envs`.
+
+For a short local training check with a small replay buffer:
+
+```bash
+python scripts/train.py algo=flashsac_vel_train task=R1/TEACH/largebox_tea \
+  algo.num_envs=8 algo.train_every=8 algo.adapt_num_minibatches=2 \
+  algo.buffer_max_length=512 algo.buffer_min_length=32 algo.sample_batch_size=16 \
+  algo.updates_per_interaction_step=1 total_frames=256 task.max_episode_length=64 \
+  wandb.mode=disabled
+```
+
 Adaptive FlashSAC student finetuning
 
 ```bash

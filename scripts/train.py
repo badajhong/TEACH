@@ -149,10 +149,12 @@ def main(cfg: DictConfig):
     run.config.update(OmegaConf.to_container(cfg))
     
     default_run_name = f"{cfg.exp_name}-{datetime.datetime.now().strftime('%Y-%m-%d-%H-%M')}"
-    run_idx = run.name.split("-")[-1]
+    run_idx = (run.name or run.id).split("-")[-1]
     run.name = f"{run_idx}-{default_run_name}"
     setproctitle(run.name)
 
+    # Disabled W&B runs can return a directory that has not been created.
+    os.makedirs(run.dir, exist_ok=True)
     cfg_save_path = os.path.join(run.dir, "cfg.yaml")
     OmegaConf.save(cfg, cfg_save_path)
     run.save(cfg_save_path, policy="now")

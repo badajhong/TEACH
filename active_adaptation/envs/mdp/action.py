@@ -42,6 +42,7 @@ class JointPosition(ActionManager):
         min_delay: int = 0,
         max_delay: int = 0,
         alpha: float | Tuple[float, float] = 0.5,
+        fixed_joint_names: str | list[str] | None = None,
         **kwargs,
     ):
         super().__init__(env)
@@ -53,6 +54,13 @@ class JointPosition(ActionManager):
         )
         self.action_scaling = torch.tensor(self.action_scaling, device=self.device)
         self.action_dim = len(self.joint_ids)
+
+        self.fixed_joint_ids, self.fixed_joint_names = [], []
+        if fixed_joint_names:
+            self.fixed_joint_ids, self.fixed_joint_names = self.asset.find_joints(fixed_joint_names)
+            overlap = set(self.joint_names) & set(self.fixed_joint_names)
+            if overlap:
+                raise ValueError(f"Fixed joints must be excluded from policy actions: {sorted(overlap)}")
 
         self.min_delay = min_delay if min_delay is not None else 0
         self.max_delay = max_delay if max_delay is not None else 0
@@ -88,6 +96,19 @@ class JointPosition(ActionManager):
         self.action_buf[env_ids] = 0
         self.applied_action[env_ids] = 0
 
+        # Motion reset runs first and may contain motion/noise for these joints.
+        # Restore their default pose before observation histories are reset.
+        if self.fixed_joint_ids and env_ids.numel():
+            default_pos = self.default_joint_pos[env_ids][:, self.fixed_joint_ids]
+            self.offset[env_ids.unsqueeze(1), self.fixed_joint_ids] = 0.0
+            self.asset.write_joint_state_to_sim(
+                default_pos, torch.zeros_like(default_pos),
+                joint_ids=self.fixed_joint_ids, env_ids=env_ids,
+            )
+            self.asset.set_joint_position_target(
+                default_pos, joint_ids=self.fixed_joint_ids, env_ids=env_ids,
+            )
+
         delay = torch.randint(self.min_delay, self.max_delay + 1, (len(env_ids), 1), device=self.device)
         self.delay[env_ids] = delay
         alpha = torch.empty(len(env_ids), 1, device=self.device).uniform_(
@@ -117,5 +138,7 @@ class JointPosition(ActionManager):
 
         pos_target = self.default_joint_pos + self.offset
         pos_target[:, self.joint_ids] += self.applied_action * self.action_scaling
+        if self.fixed_joint_ids:
+            pos_target[:, self.fixed_joint_ids] = self.default_joint_pos[:, self.fixed_joint_ids]
         self.asset.set_joint_position_target(pos_target)
         

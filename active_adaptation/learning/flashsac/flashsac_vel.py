@@ -339,6 +339,15 @@ class FlashSACVel(FlashSACVelFlat):
             f"critic selects {self.obs_dim}, actor recomputes a {cfg.latent_dim}-dim privileged feature.",
             "green",
         ))
+        command_dim = math.prod(observation_spec[self.cmd_key].shape[1:])
+        policy_dim = math.prod(observation_spec[OBS_KEY].shape[1:])
+        print(colored(
+            f"[FlashSAC VAIC] teacher actor input {command_dim + policy_dim + cfg.latent_dim} "
+            f"(command {command_dim} + policy {policy_dim} + latent {cfg.latent_dim}); "
+            f"output {self.action_dim} actions. Critic input: {self.obs_dim} state values "
+            f"+ {self.action_dim} actions.",
+            "green",
+        ))
 
     def _replay_field_shape(self, key, observation_spec):
         if key == ACTION_DR_KEY:

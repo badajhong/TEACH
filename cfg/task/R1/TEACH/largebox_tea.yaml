@@ -1,0 +1,38 @@
+# @package task
+defaults:
+  - /task/R1/TEACH/sub3_largebox_003
+  - _self_
+
+name: R1Largebox
+
+robot:
+  override_params:
+    # Match the R1 soft margin used below when clamping reset joint states.
+    soft_joint_pos_limit_factor: 0.95
+
+# The parent supplies R1 joint/body names, 24 action scales, the largebox asset,
+# and the converted sub3_largebox_003 motion. Sample the full reference clip;
+# the G1 box task's reset_range [0, 100] covers only this clip's synthetic lead-in.
+command:
+  reset_range: null
+
+# Follow G1/vaic/box_general_tracking_tea's tracking/object/regularization
+# rewards using the parent's R1 body mappings. There is no stairslope object.
+reward:
+  tracking:
+    joint_pos_tracking_product: {sigma: 0.25}
+    joint_vel_tracking_product: {sigma: 2.5}
+  loco:
+    # R1's HOI FlashSAC preset uses 0.95. The copied G1 factor 0.8 strongly
+    # penalizes valid hip/ankle poses in this reference (up to 0.424 rad).
+    joint_pos_limits: {weight: 15.0, joint_names: ".*", soft_factor: 0.95, enabled: true}
+    # No waist_pos_limits: that implementation requires waist_pitch_joint.
+  feet:
+    feet_contact: {weight: 1.0, enabled: true, body_names: .*ankle_roll_link, sigma: 0.25}
+    # This clip has short asymmetric swings and about 7-9 cm peak clearance.
+    # G1's 0.3 s air-time and 12-15 cm lift targets would fight the reference.
+    feet_air_time: null
+    feet_air_lift: null
+  debug:
+    feet_air_time: null
+    joint_pos_limits: {soft_factor: 0.95}
