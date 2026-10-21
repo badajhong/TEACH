@@ -1,0 +1,17 @@
+# @package task
+defaults:
+  # Reuse the common R1 tracking/action/reward settings.
+  - /task/R1/TEACH/sub3_largebox_003
+  - _self_
+
+name: R1Sub4Whitechair029
+
+command:
+  data_path: data/motion/r1/whitechair/sub4_whitechair_029
+  object_asset_name: whitechair_link
+  object_body_name: baseLink
+
+  # Median source hand-contact targets in the object's local frame.
+  contact_target_pos_offset:
+    - [-0.275948, -0.033353, 0.126038]
+    - [-0.007671, -0.207861, -0.086427]

@@ -47,7 +47,8 @@ class JointPosition(ActionManager):
         super().__init__(env)
         self.joint_ids, self.joint_names, self.action_scaling = (
             string_utils.resolve_matching_names_values(
-                dict(action_scaling), self.asset.joint_names
+                {name: scale for name, scale in dict(action_scaling).items() if scale is not None},
+                self.asset.joint_names,
             )
         )
         self.action_scaling = torch.tensor(self.action_scaling, device=self.device)

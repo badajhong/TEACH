@@ -2,12 +2,14 @@ import os
 
 from .objects import *
 from .g1 import *
+from .r1 import *
 
 
 ASSET_PATH = os.path.dirname(__file__)
 
 ROBOTS = {
     "g1": G1_CYLINDER_CFG,
+    "r1": R1_26DOF_CFG,
 }
 
 OBJECTS = {
@@ -16,6 +18,12 @@ OBJECTS = {
     "cart": CART_CFG,
     "wheelchair": WHEELCHAIR_CFG,
     "stairslope": STAIRSLOPE_CFG,
+    # Match the scene names stored in the R1 motion archives.
+    "largebox_link": R1_LARGEBOX_CFG,
+    "whitechair_link": R1_WHITECHAIR_CFG,
+    "smalltable_link": R1_SMALLTABLE_CFG,
+    "suitcase_link": R1_SUITCASE_CFG,
+    "plasticbox_link": R1_PLASTICBOX_CFG,
 }
 
 

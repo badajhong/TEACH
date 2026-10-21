@@ -1,0 +1,17 @@
+# @package task
+defaults:
+  # Reuse the common R1 tracking/action/reward settings.
+  - /task/R1/TEACH/sub3_largebox_003
+  - _self_
+
+name: R1Sub5Suitcase000
+
+command:
+  data_path: data/motion/r1/suitcase/sub5_suitcase_000
+  object_asset_name: suitcase_link
+  object_body_name: suitcase_link
+
+  # Median source hand-contact targets in the object's local frame.
+  contact_target_pos_offset:
+    - [-0.005666, 0.047052, -0.169955]
+    - [-0.175580, 0.042460, -0.004829]

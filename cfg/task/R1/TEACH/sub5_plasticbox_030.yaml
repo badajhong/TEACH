@@ -1,0 +1,22 @@
+# @package task
+defaults:
+  # Reuse the common R1 tracking/action/reward settings.
+  - /task/R1/TEACH/sub3_largebox_003
+  - _self_
+
+name: R1Sub5Plasticbox030
+
+command:
+  data_path: data/motion/r1/plasticbox/sub5_plasticbox_030
+  object_asset_name: plasticbox_link
+  object_body_name: plasticbox_link
+
+  # This clip pushes the box with the ankles rather than the hands.
+  contact_eef_body_name: [left_ankle_roll_link, right_ankle_roll_link]
+  contact_frc_eef_body_name: [left_ankle_roll_link, right_ankle_roll_link]
+  contact_eef_pos_offset:
+    - [0.0, 0.0, 0.0]
+    - [0.0, 0.0, 0.0]
+  contact_target_pos_offset:
+    - [0.117206, -0.082348, 0.160181]
+    - [0.250464, -0.083415, 0.086880]
