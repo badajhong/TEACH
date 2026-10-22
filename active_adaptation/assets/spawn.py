@@ -291,13 +291,14 @@ def clone(func: Callable) -> Callable:
         # clone asset using cloner API
         low, high = getattr(cfg, "scale_range", (1., 1.))
         homogeneous_scale = getattr(cfg, "homogeneous_scale", False)
+        randomize_source_scale = getattr(cfg, "randomize_source_scale", False)
         if homogeneous_scale:
             scales = torch.ones(len(prim_paths), 1)
-            scales[1:].uniform_(low, high)
+            scales[0 if randomize_source_scale else 1:].uniform_(low, high)
             scales = scales.repeat(1, 3)
         else:
             scales = torch.ones(len(prim_paths), 3)
-            scales[1:].uniform_(low, high)
+            scales[0 if randomize_source_scale else 1:].uniform_(low, high)
         cfg.scale = scales
         if len(prim_paths) > 1:
             # clone the prim
@@ -309,6 +310,18 @@ def clone(func: Callable) -> Callable:
                 replicate_physics=False,
                 copy_from_source=cfg.copy_from_source
             )
+        if randomize_source_scale:
+            # The cloner only applies `scales` to destination prims. Apply the
+            # sampled scale to the source as well, including single-env play.
+            source_xformable = UsdGeom.Xformable(prim)
+            scale_op = next(
+                (op for op in source_xformable.GetOrderedXformOps()
+                 if op.GetOpType() == UsdGeom.XformOp.TypeScale),
+                None,
+            )
+            if scale_op is None:
+                scale_op = source_xformable.AddScaleOp()
+            scale_op.Set(Gf.Vec3d(*scales[0].tolist()))
         # return the source prim
         return prim
 

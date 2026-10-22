@@ -221,6 +221,13 @@ if that checkout is elsewhere.
 - Resets sample the full clip. G1's `[0, 100]` reset range would cover only this
   converted clip's synthetic lead-in. FlashSAC controls parallelism through
   `algo.num_envs`, which overrides `task.num_envs`.
+- The largebox uses G1's object randomization: mass 1.0–1.8 kg, independent
+  XYZ scale factors 0.5–1.2, dynamic friction 0.3–0.8, static/dynamic friction
+  ratio 1.0–2.0, and restitution 0.0–0.2. These are sampled per environment at
+  scene startup, including environment 0, so changing them requires a new
+  environment. The box pose is perturbed separately on each reset. The reference
+  contact offsets follow the sampled scale; FlashSAC still uses a canonical
+  point template in its actor.
 
 For a short local training check with a small replay buffer:
 

@@ -14,7 +14,7 @@ eval_interval: -1
 save_interval: -1
 seed: 0
 checkpoint_path: null
-vecnorm: eval # ${oc.select:algo.vecnorm,train}
+vecnorm: auto # Use eval normalization only when the selected algorithm uses VecNorm.
 export_policy: false
 
 camera_follow: true

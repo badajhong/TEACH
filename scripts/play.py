@@ -21,6 +21,8 @@ from active_adaptation.utils.wandb import parse_checkpoint_path
 def main(cfg):
     OmegaConf.resolve(cfg)
     OmegaConf.set_struct(cfg, False)
+    if cfg.vecnorm == "auto":
+        cfg.vecnorm = None if cfg.algo.get("vecnorm", "eval") is None else "eval"
     
     app_launcher = AppLauncher(cfg.app)
     simulation_app = app_launcher.app

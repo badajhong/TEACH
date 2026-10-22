@@ -156,6 +156,7 @@ class SimpleEnv(_Env):
                     asset.spawn.func = clone(spawn_func)
                     asset.spawn.scale_range = tuple(body_scale_rand.scale_range)
                     asset.spawn.homogeneous_scale = body_scale_rand.get("homogeneous_scale", False)
+                    asset.spawn.randomize_source_scale = body_scale_rand.get("randomize_source_scale", False)
                     print(f"Randomized {body_scale_rand.name} scale to {asset.spawn.scale_range}")
                 else:
                     for i, name, scale_range in zip(range(len(body_scale_rand.name)), body_scale_rand.name, body_scale_rand.scale_range):
@@ -170,6 +171,7 @@ class SimpleEnv(_Env):
                                 asset.spawn.homogeneous_scale = body_scale_rand.homogeneous_scale[i]
                         else:
                             asset.spawn.homogeneous_scale = body_scale_rand.get("homogeneous_scale", False)
+                        asset.spawn.randomize_source_scale = body_scale_rand.get("randomize_source_scale", False)
                         print(f"Randomized {name} scale to {asset.spawn.scale_range}")
 
             scene_cfg.terrain = TERRAINS[self.cfg.terrain]

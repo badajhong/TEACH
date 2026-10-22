@@ -16,6 +16,20 @@ robot:
 command:
   reset_range: null
 
+# Use the G1 box task's object domain randomization for the single R1 largebox.
+# Size is sampled per environment when the USD is spawned; mass and material
+# properties are sampled per environment at simulation startup.
+randomization:
+  object_body_randomization:
+    static_dynamic_friction_ratio_range: [1.0, 2.0]
+    dynamic_friction_range: [0.3, 0.8]
+    restitution_range: [0.0, 0.2]
+    mass_range: [1.0, 1.8]
+  body_scale:
+    name: largebox_link
+    scale_range: [0.5, 1.0]
+    randomize_source_scale: true
+
 # Follow G1/vaic/box_general_tracking_tea's tracking/object/regularization
 # rewards using the parent's R1 body mappings. There is no stairslope object.
 reward:

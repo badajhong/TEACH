@@ -48,6 +48,10 @@ class R1LargeboxTest(unittest.TestCase):
         self.assertEqual(task.reward.loco.joint_pos_limits.soft_factor, 0.95)
         self.assertEqual(task.robot.override_params.soft_joint_pos_limit_factor, 0.95)
         self.assertEqual(task.reward.debug.joint_pos_limits.soft_factor, 0.95)
+        self.assertEqual(task.randomization.object_body_randomization.mass_range, [1.0, 1.8])
+        self.assertEqual(task.randomization.body_scale.name, "largebox_link")
+        self.assertEqual(task.randomization.body_scale.scale_range, [0.5, 1.2])
+        self.assertTrue(task.randomization.body_scale.randomize_source_scale)
 
     def setUp(self):
         self.old_threads = torch.get_num_threads()
