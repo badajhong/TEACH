@@ -1,0 +1,125 @@
+defaults:
+  static_friction_range:
+  - 0.3
+  - 1.6
+  dynamic_friction_range:
+  - 0.3
+  - 1.2
+  restitution_range:
+  - 0.0
+  - 0.5
+  mass_distribution_params:
+  - 1.0
+  - 4.0
+  inertia_distribution_params_dict:
+    Ixx:
+    - 0.5
+    - 1.5
+    Iyy:
+    - 0.5
+    - 1.5
+    Izz:
+    - 0.5
+    - 1.5
+    Ixy:
+    - 0.5
+    - 1.5
+    Iyz:
+    - 0.5
+    - 1.5
+    Ixz:
+    - 0.5
+    - 1.5
+objects:
+  suitcase:
+    static_friction_range:
+    - 0.1
+    - 0.2
+    dynamic_friction_range:
+    - 0.05
+    - 0.2
+    restitution_range:
+    - 0.0
+    - 1.0
+    mass_distribution_params:
+    - 1.0
+    - 2.0
+  smalltable:
+    static_friction_range:
+    - 0.3
+    - 2.0
+    dynamic_friction_range:
+    - 0.3
+    - 1.2
+    restitution_range:
+    - 0.0
+    - 0.5
+    mass_distribution_params:
+    - 1.0
+    - 2.0
+  whitechair:
+    static_friction_range:
+    - 0.3
+    - 2.0
+    dynamic_friction_range:
+    - 0.3
+    - 1.2
+    restitution_range:
+    - 0.0
+    - 0.5
+    mass_distribution_params:
+    - 1.0
+    - 2.0
+  largebox:
+    static_friction_range:
+    - 0.3
+    - 1.6
+    dynamic_friction_range:
+    - 0.3
+    - 1.2
+    restitution_range:
+    - 0.0
+    - 0.5
+    mass_distribution_params:
+    - 1.0
+    - 4.0
+  plasticbox:
+    static_friction_range:
+    - 0.3
+    - 1.0
+    dynamic_friction_range:
+    - 0.3
+    - 1.0
+    restitution_range:
+    - 0.0
+    - 0.5
+    mass_distribution_params:
+    - 0.5
+    - 2.0
+  resmimicchair:
+    static_friction_range:
+    - 0.3
+    - 2.0
+    dynamic_friction_range:
+    - 0.3
+    - 1.2
+    restitution_range:
+    - 0.0
+    - 0.5
+    mass_distribution_params:
+    - 1.0
+    - 2.0
+
+task_index:
+  - sub1_suitcase_050
+  - sub5_suitcase_000
+  - sub17_smalltable_014
+  - sub17_smalltable_010
+  - sub6_smalltable_030
+  - sub4_whitechair_029
+  - sub4_whitechair_030
+  - sub3_largebox_003
+  - sub3_largebox_020
+  - sub7_largebox_000
+  - sub5_plasticbox_030
+  - sub5_plasticbox_000
