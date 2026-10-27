@@ -1,0 +1,10 @@
+# @package task
+defaults:
+  - /task/R1/rl/sub3_largebox_003_tea
+  - _self_
+
+name: R1RlSub3Largebox003Stu
+
+# The joint student policy consumes depth. Keep the R1 camera's 68 x 56 rays,
+# 146 x 124 degree FOV, 0.1 s period, and 0.1-1.5 m range from rl/base.yaml.
+enable_cameras: true

@@ -16,6 +16,13 @@ seed: 0
 checkpoint_path: null
 vecnorm: auto # Use eval normalization only when the selected algorithm uses VecNorm.
 export_policy: false
+freeze_neutral_pose: false # Hold the default standing pose and refresh camera rays without physics.
+save_depth_png: false
+depth_png:
+  directory: null # Defaults to this Hydra run's output directory / depth_png.
+  env_id: 0
+  interval: null # Seconds; null uses the camera update period (R1: 0.1 s).
+  max_frames: 0 # Record continuously; set to 1 for a single snapshot.
 
 camera_follow: true
 

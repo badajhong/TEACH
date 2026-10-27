@@ -1,0 +1,24 @@
+# @package task
+defaults:
+  - /task/R1/rl/base
+  - _self_
+
+name: R1RlSub3Largebox020
+
+command:
+  data_path: data/motion/r1/rl/largebox/sub3_largebox_020
+  # This clip interacts with the object through the feet.
+  contact_eef_body_name: [left_ankle_roll_link, right_ankle_roll_link]
+  contact_frc_eef_body_name: [left_ankle_roll_link, right_ankle_roll_link]
+  contact_eef_pos_offset:
+    - [0.0, 0.0, 0.0]
+    - [0.0, 0.0, 0.0]
+  contact_target_pos_offset:
+    - [0.0, 0.0, 0.0]
+    - [0.0664, -0.1016, 0.1829]
+
+randomization:
+  body_scale:
+    name: largebox_link
+    scale_range: [0.5, 1.0]
+    randomize_source_scale: true

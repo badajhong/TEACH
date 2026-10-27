@@ -17,6 +17,53 @@ from active_adaptation.utils.export import export_onnx
 from active_adaptation.utils.wandb import parse_checkpoint_path
 
 
+@torch.inference_mode()
+def _play_neutral_pose(base_env, simulation_app, depth_writer=None):
+    """Inspect camera rays on a stationary robot in its default standing pose."""
+    import time
+    from isaaclab.utils.math import yaw_quat
+
+    if base_env.backend != "isaac":
+        raise ValueError("freeze_neutral_pose requires the Isaac backend.")
+
+    base_env.eval()
+    base_env.reset()
+    robot = base_env.scene["robot"]
+    root_pose = robot.data.default_root_state[:, :7].clone()
+    root_pose[:, :3] += base_env.scene.env_origins
+    # Preserve the starting location and heading relative to the scene objects.
+    # Remove root tilt, and use the asset's default joint angles (including the head).
+    root_pose[:, :2] = robot.data.root_link_pos_w[:, :2]
+    root_pose[:, 3:7] = yaw_quat(robot.data.root_link_quat_w)
+    robot.write_root_link_pose_to_sim(root_pose)
+    robot.write_root_com_velocity_to_sim(torch.zeros_like(robot.data.default_root_state[:, 7:]))
+    robot.write_joint_state_to_sim(
+        robot.data.default_joint_pos.clone(), torch.zeros_like(robot.data.default_joint_vel)
+    )
+    base_env.sim.forward()
+    base_env.scene.update(0.0)
+
+    camera = base_env.scene.sensors.get("tiled_camera")
+    refresh_period = max(camera.cfg.update_period, 1 / 60) if camera is not None else 0.1
+    next_refresh = 0.0
+    print("[INFO] Neutral pose frozen: physics and replay paused; camera rays remain active.")
+    while simulation_app.is_running():
+        frame_start = time.perf_counter()
+        if frame_start >= next_refresh:
+            if camera is not None:
+                camera.update(refresh_period, force_recompute=True)
+            if depth_writer is not None:
+                depth_writer.update(refresh_period)
+            if hasattr(base_env, "debug_draw"):
+                base_env.debug_draw.clear()
+                base_env._visualize_camera_rays()
+            if base_env.sim.has_gui():
+                base_env.update_vis_ui()
+            next_refresh = frame_start + refresh_period
+        base_env.sim.render()
+        time.sleep(max(0.0, 1 / 60 - (time.perf_counter() - frame_start)))
+
+
 @hydra.main(config_path="../cfg", config_name="play", version_base=None)
 def main(cfg):
     OmegaConf.resolve(cfg)
@@ -29,6 +76,37 @@ def main(cfg):
 
     from helpers import EpisodeStats, make_env_policy, ObsNorm, ObsOODDetector
     env, policy, vecnorm = make_env_policy(cfg)
+
+    depth_writer = None
+    if cfg.save_depth_png:
+        from hydra.core.hydra_config import HydraConfig
+        from depth_png import DepthPngWriter
+
+        camera = env.base_env.scene.sensors.get("tiled_camera")
+        if camera is None:
+            raise ValueError("save_depth_png requires task.enable_cameras=true.")
+        directory = (
+            hydra.utils.to_absolute_path(cfg.depth_png.directory)
+            if cfg.depth_png.directory
+            else os.path.join(HydraConfig.get().runtime.output_dir, "depth_png")
+        )
+        depth_writer = DepthPngWriter(
+            camera, directory, env_id=cfg.depth_png.env_id,
+            interval=cfg.depth_png.interval, max_frames=cfg.depth_png.max_frames,
+        )
+        if not cfg.freeze_neutral_pose:
+            # Capture before replay resets, with a clock independent of sensor reset timestamps.
+            env.base_env._post_step_callbacks.append(
+                lambda substep: depth_writer.update(env.base_env.physics_dt)
+            )
+
+    if cfg.freeze_neutral_pose:
+        try:
+            _play_neutral_pose(env.base_env, simulation_app, depth_writer)
+        finally:
+            env.close()
+            simulation_app.close()
+        return
     
     if cfg.export_policy:
         import time

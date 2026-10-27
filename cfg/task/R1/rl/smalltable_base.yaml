@@ -1,0 +1,24 @@
+# @package task
+defaults:
+  # Reuse the common R1 tracking/action/reward settings.
+  - /task/R1/rl/base
+  - _self_
+
+name: R1RlSmalltableBase
+
+command:
+  data_path: data/motion/r1/rl/smalltable/sub17_smalltable_010
+  object_asset_name: smalltable_link
+  object_body_name: baseLink
+
+  # Median source hand-contact targets in the object's local frame.
+  contact_target_pos_offset:
+    - [-0.026586, 0.052716, -0.168170]
+    - [-0.142984, -0.073950, 0.173612]
+
+randomization:
+  body_scale:
+    name: smalltable_link
+    scale_range: [0.8, 1.1]
+    homogeneous_scale: true
+    randomize_source_scale: true

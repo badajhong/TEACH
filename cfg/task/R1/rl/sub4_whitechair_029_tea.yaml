@@ -1,0 +1,12 @@
+# @package task
+defaults:
+  - /task/R1/rl/whitechair_base
+  - _self_
+
+name: R1RlSub4Whitechair029
+
+command:
+  data_path: data/motion/r1/rl/whitechair/sub4_whitechair_029
+  contact_target_pos_offset:
+    - [-0.4124, 0.0167, -0.0311]
+    - [-0.1585, -0.2358, -0.1830]

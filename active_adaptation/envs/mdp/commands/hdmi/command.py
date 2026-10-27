@@ -11,9 +11,21 @@ import numpy as np
 from isaaclab.utils.math import sample_uniform, quat_from_euler_xyz, quat_mul, quat_apply, quat_apply_inverse
 from tensordict import TensorDict
 from active_adaptation.utils.math import batchify
+from active_adaptation.utils.object_scale import support_height_offset
 quat_apply = batchify(quat_apply)
 quat_apply_inverse = batchify(quat_apply_inverse)
 torch.set_printoptions(precision=3, sci_mode=False, linewidth=120)
+
+
+def _spawn_scale(asset, num_envs: int, device) -> torch.Tensor:
+    scale = getattr(asset.cfg.spawn, "scale", None)
+    if isinstance(scale, torch.Tensor):
+        return scale.to(device)
+    if scale is None:
+        return torch.ones(num_envs, 3, device=device)
+    if isinstance(scale, (float, int, tuple, list)):
+        return torch.as_tensor(scale, dtype=torch.float32, device=device).expand(num_envs, 3)
+    raise ValueError(f"Invalid scale type: {type(scale)}")
 
 class RobotTracking(Command):
     def __init__(
@@ -362,6 +374,7 @@ class RobotObjectTracking(RobotTracking):
         object_pose_range_per_motion: List[Dict[str, Tuple[float, float]]] | None = None,
         object_init_joint_pos_noise: float = 0.1, 
         object_init_joint_vel_noise: float = 0.1,
+        object_ground_clearance: float | None = None,
         # for contact rewards
         contact_eef_body_name: List[str] = ["left_wrist_yaw_link", "right_wrist_yaw_link"],
         contact_frc_eef_body_name: List[str | List[str]] = ["left_wrist_(roll|pitch|yaw)_link", "right_wrist_(roll|pitch|yaw)_link"],
@@ -528,21 +541,17 @@ class RobotObjectTracking(RobotTracking):
                 self.eef2_contact_forces_w = torch.zeros(self.num_envs, len(contact2_eef_body_name), 3, device=self.device)
                 self.eef2_contact_forces_b = torch.zeros(self.num_envs, len(contact2_eef_body_name), 3, device=self.device)
 
-        scale = getattr(self.object.cfg.spawn, "scale", None)
-        if not isinstance(scale, torch.Tensor):
-            scale_tensor = torch.ones(self.num_envs, 3)
-            if scale is None:
-                pass
-            elif isinstance(scale, float):
-                scale_tensor[:] = scale
-            elif isinstance(scale, tuple):
-                scale_tensor[:] = torch.tensor(scale)
-            else:
-                raise ValueError(f"Invalid scale type: {type(scale)}")
-            scale = scale_tensor
-        self.contact_target_pos_offset *= scale.unsqueeze(1).to(self.device)
+        self.object_scale = _spawn_scale(self.object, self.num_envs, self.device)
+        self.object_ground_clearance = object_ground_clearance
+        self.object_height_offset = torch.zeros(self.num_envs, device=self.device)
+        self.contact_target_pos_offset *= self.object_scale.unsqueeze(1)
         if self.object2 is not None:
-            self.contact2_target_pos_offset *= scale.unsqueeze(1).to(self.device)   
+            self.object2_scale = _spawn_scale(self.object2, self.num_envs, self.device)
+            self.object2_height_offset = torch.zeros(self.num_envs, device=self.device)
+            self.contact2_target_pos_offset *= self.object2_scale.unsqueeze(1)
+        self.extra_object_scales = [
+            _spawn_scale(asset, self.num_envs, self.device) for asset in self.extra_objects
+        ]
 
         # load object contact data (supports multiple motion paths)
         motion_paths = self.dataset.motion_paths
@@ -554,6 +563,7 @@ class RobotObjectTracking(RobotTracking):
         all_body_contact = []
         all_feet_contact = []
         all_body2_contact = []
+        all_object_points = []
         first_motion_data = None
         for path in motion_paths:
             motion_data = np.load(path, allow_pickle=True)
@@ -562,6 +572,7 @@ class RobotObjectTracking(RobotTracking):
             all_object_contact.append(motion_data["object_contact"])
             all_body_contact.append(motion_data["body_contact"][:, contact_eef_body_idx])
             all_feet_contact.append(motion_data["feet_contact"])
+            all_object_points.append(np.asarray(motion_data["object_points"], dtype=np.float32))
             if self.object2 is not None:
                 all_body2_contact.append(motion_data["body_contact"][:, contact2_eef_body_idx])
 
@@ -569,6 +580,26 @@ class RobotObjectTracking(RobotTracking):
         body_contact = np.concatenate(all_body_contact, axis=0)
         feet_contact = np.concatenate(all_feet_contact, axis=0)
         object_points = first_motion_data["object_points"]  # [1, 128, 3] — same box shape for all motions
+        self._object_support_points = torch.as_tensor(
+            np.stack([points[0] for points in all_object_points]), device=self.device
+        )
+        if self.object2 is not None:
+            self._object2_support_points = torch.as_tensor(
+                np.stack([points[1] for points in all_object_points]), device=self.device
+            )
+        self._extra_support_points = []
+        for extra_idx in range(len(self.extra_objects)):
+            point_idx = extra_idx + 1 + int(self.object2 is not None)
+            first_available = next(
+                (points[point_idx] for points in all_object_points if len(points) > point_idx),
+                None,
+            )
+            if first_available is None:
+                raise ValueError(f"No object points for extra object {extra_object_names[extra_idx]}")
+            self._extra_support_points.append(torch.as_tensor(np.stack([
+                points[point_idx] if len(points) > point_idx else first_available
+                for points in all_object_points
+            ]), device=self.device))
 
         self._object_contact = torch.tensor(object_contact[...,:1], device=self.device, dtype=torch.bool)
         self._body_contact = torch.tensor(body_contact, device=self.device, dtype=torch.bool) & self._object_contact
@@ -582,7 +613,7 @@ class RobotObjectTracking(RobotTracking):
             self.object2_points = torch.tensor(object_points[1:2], device=self.device).repeat(self.num_envs, 1, 1)
 
         if len(self.extra_objects) > 0:
-            self.extra_object_points = torch.tensor(object_points[-1:], device=self.device).repeat(self.num_envs, 1, 1)
+            self.extra_object_points = self._extra_support_points[0][0:1].repeat(self.num_envs, 1, 1)
 
         # per-motion mask: True if the motion has a stairslope extra object (all motions except box_1)
         self._motion_has_extra_object = torch.tensor(
@@ -635,7 +666,10 @@ class RobotObjectTracking(RobotTracking):
         # Update per-motion contact offsets, pose_range, object_pose_range
         motion_ids_for_envs = self.motion_ids[env_ids]
         if hasattr(self, "_contact_target_pos_offset_per_motion"):
-            self.contact_target_pos_offset[env_ids] = self._contact_target_pos_offset_per_motion[motion_ids_for_envs]
+            self.contact_target_pos_offset[env_ids] = (
+                self._contact_target_pos_offset_per_motion[motion_ids_for_envs]
+                * self.object_scale[env_ids].unsqueeze(1)
+            )
         if hasattr(self, "_contact_eef_pos_offset_per_motion"):
             self.contact_eef_pos_offset[env_ids] = self._contact_eef_pos_offset_per_motion[motion_ids_for_envs]
         if hasattr(self, "_pose_range_per_motion"):
@@ -646,7 +680,7 @@ class RobotObjectTracking(RobotTracking):
     def sample_init(self, env_ids):
         super().sample_init(env_ids)
 
-        init_object_pos = self._motion_reset.body_pos_w[:, self.object_body_id_motion]
+        init_object_pos = self._motion_reset.body_pos_w[:, self.object_body_id_motion].clone()
         init_object_quat = self._motion_reset.body_quat_w[:, self.object_body_id_motion]
 
         rand_samples = sample_uniform(self.object_pose_range[:, 0], self.object_pose_range[:, 1], (len(env_ids), 6), device=self.device)
@@ -654,6 +688,20 @@ class RobotObjectTracking(RobotTracking):
         init_object_pos += rand_samples[:, 0:3]
         orientations_delta = quat_from_euler_xyz(rand_samples[:, 3], rand_samples[:, 4], rand_samples[:, 5])
         init_object_quat = quat_mul(init_object_quat, orientations_delta)
+        if self.object_ground_clearance is None:
+            height_offset = support_height_offset(
+                self._object_support_points[self.motion_ids[env_ids]],
+                init_object_quat,
+                self.object_scale[env_ids],
+            )
+        else:
+            # Use collision geometry for articulated assets whose observation
+            # point clouds omit wheels (skateboard and cart).
+            height_offset = (
+                self.object_scale[env_ids, 2] - 1.0
+            ) * float(self.object_ground_clearance)
+        self.object_height_offset[env_ids] = height_offset
+        init_object_pos[:, 2] += height_offset
         
         init_object_state_w = self.object.data.default_root_state[env_ids]
         init_object_state_w[:, 0:3] = init_object_pos + self.env.scene.env_origins[env_ids]
@@ -664,12 +712,21 @@ class RobotObjectTracking(RobotTracking):
         self.object.write_root_com_velocity_to_sim(init_object_state_w[:, 7:], env_ids=env_ids)
 
         if self.object2 is not None:
-            init_object2_pos = self._motion_reset.body_pos_w[:, self.object2_body_id_motion]
+            init_object2_pos = self._motion_reset.body_pos_w[:, self.object2_body_id_motion].clone()
             init_object2_quat = self._motion_reset.body_quat_w[:, self.object2_body_id_motion]
-            rand_samples = sample_uniform(self.object2_pose_range[:, 0], self.object2_pose_range[:, 1], (len(env_ids), 6), device=self.device)
-            init_object2_pos += rand_samples[:, 0:3]
-            orientations_delta = quat_from_euler_xyz(rand_samples[:, 3], rand_samples[:, 4], rand_samples[:, 5])
-            init_object2_quat = quat_mul(init_object2_quat, orientations_delta)
+            object2_rand_samples = sample_uniform(self.object2_pose_range[:, 0], self.object2_pose_range[:, 1], (len(env_ids), 6), device=self.device)
+            init_object2_pos += object2_rand_samples[:, 0:3]
+            object2_orientation_delta = quat_from_euler_xyz(
+                object2_rand_samples[:, 3], object2_rand_samples[:, 4], object2_rand_samples[:, 5]
+            )
+            init_object2_quat = quat_mul(init_object2_quat, object2_orientation_delta)
+            object2_height_offset = support_height_offset(
+                self._object2_support_points[self.motion_ids[env_ids]],
+                init_object2_quat,
+                self.object2_scale[env_ids],
+            )
+            self.object2_height_offset[env_ids] = object2_height_offset
+            init_object2_pos[:, 2] += object2_height_offset
             init_object2_state_w = self.object2.data.default_root_state[env_ids]
             init_object2_state_w[:, 0:3] = init_object2_pos + self.env.scene.env_origins[env_ids]
             init_object2_state_w[:, 3:7] = init_object2_quat
@@ -678,12 +735,19 @@ class RobotObjectTracking(RobotTracking):
             self.object2.write_root_link_pose_to_sim(init_object2_state_w[:, 0:7], env_ids=env_ids)
             self.object2.write_root_com_velocity_to_sim(init_object2_state_w[:, 7:], env_ids=env_ids)
 
-        for object_, object_body_id_motion in zip(self.extra_objects, self.extra_object_body_id_motion):
-            init_object_pos = self._motion_reset.body_pos_w[:, object_body_id_motion]
+        for extra_idx, (object_, object_body_id_motion) in enumerate(
+            zip(self.extra_objects, self.extra_object_body_id_motion)
+        ):
+            init_object_pos = self._motion_reset.body_pos_w[:, object_body_id_motion].clone()
             init_object_quat = self._motion_reset.body_quat_w[:, object_body_id_motion]
 
             init_object_pos += rand_samples[:, 0:3]
             init_object_quat = quat_mul(init_object_quat, orientations_delta)
+            init_object_pos[:, 2] += support_height_offset(
+                self._extra_support_points[extra_idx][self.motion_ids[env_ids]],
+                init_object_quat,
+                self.extra_object_scales[extra_idx][env_ids],
+            )
 
             init_object_state_w = object_.data.default_root_state[env_ids]
             init_object_state_w[:, 0:3] = init_object_pos + self.env.scene.env_origins[env_ids]
@@ -788,6 +852,7 @@ class RobotObjectTracking(RobotTracking):
             motion_frame["body_ang_vel_w"] = torch.cat([motion_frame["body_ang_vel_w"], object_ang_vel_w.unsqueeze(1)], dim=1)
 
         self.ref_object_pos_future_w = self.future_ref_motion.body_pos_w[..., self.object_body_id_motion, :] + self.env.scene.env_origins[:, None, :]
+        self.ref_object_pos_future_w[..., 2] += self.object_height_offset[:, None]
         self.ref_object_quat_future_w = self.future_ref_motion.body_quat_w[..., self.object_body_id_motion, :]
         self.ref_object_lin_vel_future_w = self.future_ref_motion.body_lin_vel_w[..., self.object_body_id_motion, :]
         self.ref_object_pos_w = self.ref_object_pos_future_w[:, 0]
@@ -807,6 +872,7 @@ class RobotObjectTracking(RobotTracking):
 
         if self.object2 is not None:
             self.ref_object2_pos_future_w = self.future_ref_motion.body_pos_w[..., self.object2_body_id_motion, :] + self.env.scene.env_origins[:, None, :]
+            self.ref_object2_pos_future_w[..., 2] += self.object2_height_offset[:, None]
             self.ref_object2_quat_future_w = self.future_ref_motion.body_quat_w[..., self.object2_body_id_motion, :]
             self.ref_object2_lin_vel_future_w = self.future_ref_motion.body_lin_vel_w[..., self.object2_body_id_motion, :]
             self.ref_object2_pos_w = self.ref_object2_pos_future_w[:, 0]

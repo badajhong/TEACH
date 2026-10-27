@@ -54,6 +54,9 @@ class GroupedRayCasterCameraCfg(GroupedRayCasterCfg):
       for ``distance_to_image_plane`` data type.
     """
 
+    cover_full_image_plane_depth: bool = False
+    """Extend ray travel so the configured image-plane depth reaches every pixel."""
+
     pattern_cfg: PinholeCameraPatternCfg = MISSING
     """The pattern that defines the local ray starting positions and directions in a pinhole camera pattern."""
 

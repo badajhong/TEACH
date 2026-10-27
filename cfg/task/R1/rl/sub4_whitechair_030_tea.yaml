@@ -1,0 +1,10 @@
+# @package task
+defaults:
+  - /task/R1/rl/whitechair_base
+  - _self_
+
+name: R1RlSub4Whitechair030
+
+command:
+  data_path: data/motion/r1/rl/whitechair/sub4_whitechair_030
+  # The source clip has no labeled object contact; inherited offsets are unused.

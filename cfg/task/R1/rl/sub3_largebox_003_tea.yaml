@@ -1,0 +1,12 @@
+# @package task
+defaults:
+  - /task/R1/rl/largebox_base
+  - _self_
+
+name: R1RlSub3Largebox003
+
+command:
+  data_path: data/motion/r1/rl/largebox/sub3_largebox_003
+  contact_target_pos_offset:
+    - [0.1746, 0.0109, 0.0055]
+    - [-0.1090, -0.1384, -0.0277]

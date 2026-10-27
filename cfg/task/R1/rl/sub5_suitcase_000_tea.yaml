@@ -1,0 +1,12 @@
+# @package task
+defaults:
+  - /task/R1/rl/suitcase_base
+  - _self_
+
+name: R1RlSub5Suitcase000
+
+command:
+  data_path: data/motion/r1/rl/suitcase/sub5_suitcase_000
+  contact_target_pos_offset:
+    - [0.0127, 0.1435, -0.1941]
+    - [-0.1802, 0.1297, 0.0039]

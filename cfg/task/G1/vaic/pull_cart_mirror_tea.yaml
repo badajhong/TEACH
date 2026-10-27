@@ -35,6 +35,8 @@ command:
 
   object_asset_name: "cart"
   object_body_name:  "board_deck"
+  # Lowest wheel collision geometry is 0.16 m below the cart root.
+  object_ground_clearance: 0.16
   object_joint_name: ["front_left_wheel_joint_0","front_right_wheel_joint_0","rear_left_wheel_joint_0","rear_right_wheel_joint_0", "front_left_wheel_joint_1","front_right_wheel_joint_1","rear_left_wheel_joint_1","rear_right_wheel_joint_1"]
 
   object_pose_range:

@@ -17,6 +17,9 @@ class GroupedRayCasterCfg(MultiMeshRayCasterCfg):
     min_distance: float = 0.0
     """The minimum distance from the sensor to ray cast to. aka ignore the hits closer than this distance."""
 
+    use_per_env_mesh_ids: bool = False
+    """Use each environment's mesh when object scale changes its geometry."""
+
 
 def get_link_prim_targets(
     links: list[str],

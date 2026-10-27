@@ -1,0 +1,12 @@
+# @package task
+defaults:
+  - /task/R1/rl/plasticbox_base
+  - _self_
+
+name: R1RlSub5Plasticbox030
+
+command:
+  data_path: data/motion/r1/rl/plasticbox/sub5_plasticbox_030
+  contact_target_pos_offset:
+    - [0.1172, -0.0823, 0.1599]
+    - [0.2494, -0.0834, 0.0869]

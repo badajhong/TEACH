@@ -129,11 +129,15 @@ class GroupedRayCaster(MultiMeshRayCaster):
             for prim in prims:
                 prim_path = prim.GetPath().pathString
                 prim_path_ = regex.sub(r"env_\d+", "env_0", prim_path)
-                assert prim_path_ in GroupedRayCaster.meshes, (
-                    f"Mesh at prim path {prim_path} (casted to {prim_path_}) not found in the mesh cache"
-                    f" {GroupedRayCaster.meshes.keys()}"
-                )
-                ids.append(GroupedRayCaster.meshes[prim_path_].id)
+                # Unique per-environment scale produces a distinct Warp mesh.
+                # Opt in per task so existing G1 camera behavior stays intact.
+                mesh = (GroupedRayCaster.meshes.get(prim_path)
+                        if self.cfg.use_per_env_mesh_ids else None)
+                if mesh is None:
+                    mesh = GroupedRayCaster.meshes.get(prim_path_)
+                if mesh is None:
+                    raise RuntimeError(f"Raycast mesh missing for {prim_path}")
+                ids.append(mesh.id)
 
             ids_tensor = torch.tensor(ids, device=self._device, dtype=torch.int64)
             count = self._num_meshes_per_env[target_cfg.prim_expr]

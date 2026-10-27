@@ -1,0 +1,216 @@
+# @package task
+defaults:
+  - /task/base/hdmi-base
+  - _self_
+
+name: R1RlBase
+
+enable_cameras: false
+camera_width: 68
+camera_height: 56
+camera_sensor:
+  parent_link: head_yaw_link
+  # The R1 USD duplicates robot triangles in visual and collision prims.
+  # Depth uses the visual copy and shares unchanged link meshes across envs.
+  raycast_visuals_only: true
+  use_per_env_mesh_ids: true
+  offset_pos: [0.066971, 0.0, -0.010]
+  offset_rot: [0.9854375906, 0.0, 0.1700375105, 0.0]
+  horizontal_fov_deg: 146.0
+  vertical_fov_deg: 124.0
+  update_period: 0.1
+  min_distance: 0.1
+  max_distance: 1.5
+  depth_clipping_behavior: max
+  # Wide edge rays must travel farther than 1.5 m to reach 1.5 m image-plane depth.
+  cover_full_image_plane_depth: true
+  visualize_hits_only: true
+num_envs: 4096
+
+viewer:
+  env_spacing: 5.0
+  lookat: [0.6, 0.4, 0.7]
+  eye: [3.0, -3.0, 1.5]
+
+terrain: plane
+
+robot:
+  name: r1
+  robot_type: r1_26dof
+
+# Match Holosoma's effort/Kp-derived target scales.  R1 has 26 simulated DOFs,
+# but its two head joints hold default targets, giving a 24-action policy.
+action:
+  fixed_joint_names: [head_pitch_joint, head_yaw_joint]
+  action_scaling:
+    .*_hip_yaw_joint: 0.15
+    .*_hip_roll_joint: 0.15
+    .*_hip_pitch_joint: 0.15
+    .*_knee_joint: 0.15
+    .*_ankle_pitch_joint: 0.3125
+    .*_ankle_roll_joint: 0.3125
+    waist_roll_joint: 0.15
+    waist_pitch_joint: null # Disable the joint inherited from hdmi-base; R1 has no waist pitch.
+    waist_yaw_joint: 0.15
+    .*_shoulder_pitch_joint: 0.375
+    .*_shoulder_roll_joint: 0.375
+    .*_shoulder_yaw_joint: 0.4125
+    .*_elbow_joint: 0.4125
+    .*_wrist_roll_joint: 0.4125
+  min_delay: 0
+  max_delay: 0
+  alpha: 1.0
+
+command:
+  data_path: data/motion/r1/rl/largebox/sub3_largebox_003
+  root_body_name: pelvis_link
+  replay_motion: false
+
+  tracking_keypoint_names:
+    - pelvis_link
+    - left_hip_roll_link
+    - left_knee_link
+    - left_ankle_roll_link
+    - right_hip_roll_link
+    - right_knee_link
+    - right_ankle_roll_link
+    - waist_yaw_link
+    - left_shoulder_roll_link
+    - left_elbow_link
+    - left_wrist_roll_link
+    - right_shoulder_roll_link
+    - right_elbow_link
+    - right_wrist_roll_link
+
+  tracking_joint_names:
+    - .*_hip_.*_joint
+    - .*_knee_joint
+    - .*_ankle_.*_joint
+    - waist_(roll|yaw)_joint
+    - .*_shoulder_.*_joint
+    - .*_elbow_joint
+    - .*_wrist_roll_joint
+
+  object_asset_name: largebox_link
+  object_body_name: baseLink
+
+  contact_eef_body_name: [left_wrist_roll_link, right_wrist_roll_link]
+  contact_frc_eef_body_name: [left_wrist_roll_link, right_wrist_roll_link]
+  contact_eef_pos_offset:
+    - [0.1, 0.0, 0.0]
+    - [0.1, 0.0, 0.0]
+  # Median source contact targets during valid left/right hand contact frames.
+  contact_target_pos_offset:
+    - [0.156243, 0.020632, 0.175743]
+    - [-0.111520, -0.120632, 0.131018]
+
+  pose_range:
+    x: [-0.05, 0.05]
+    y: [-0.05, 0.05]
+    z: [-0.01, 0.01]
+    roll: [-0.1, 0.1]
+    pitch: [-0.1, 0.1]
+    yaw: [-0.2, 0.2]
+  velocity_range:
+    x: [-0.1, 0.1]
+    y: [-0.1, 0.1]
+    z: [-0.05, 0.05]
+    roll: [-0.1, 0.1]
+    pitch: [-0.1, 0.1]
+    yaw: [-0.1, 0.1]
+  init_joint_pos_noise: 0.1
+  init_joint_vel_noise: 0.1
+
+observation:
+  depth:
+    depth_camera: {camera_name: tiled_camera, min_depth: 0.1, max_depth: 1.5, nan_to_num: 1.5}
+  object_:
+    object_pos_b: {}
+    object_ori_b: {}
+  object_geo_:
+    object_points: {}
+  vel_command:
+    ref_root_vel_future_b: {}
+    ref_contact_flag_future: {}
+  priv:
+    body_height:
+      body_names: [.*_ankle_roll_link, pelvis_link, waist_yaw_link]
+
+reward:
+  tracking:
+    tracking_upper_body_pos(keypoint_pos_tracking_local_product):
+      body_names: [.*_shoulder_roll_link, .*_elbow_link, .*_wrist_roll_link]
+      weight: 0.5
+      sigma: 0.5
+    tracking_upper_body_ori(keypoint_ori_tracking_local_product):
+      body_names: [.*_shoulder_roll_link, .*_elbow_link, .*_wrist_roll_link]
+      weight: 0.5
+      sigma: 1.0
+    tracking_lower_body_pos(keypoint_pos_tracking_local_product):
+      body_names: [.*_hip_roll_link, .*_knee_link, .*_ankle_roll_link]
+      weight: 0.5
+      sigma: 0.5
+    tracking_lower_body_ori(keypoint_ori_tracking_local_product):
+      body_names: [.*_hip_roll_link, .*_knee_link, .*_ankle_roll_link]
+      weight: 0.5
+      sigma: 1.0
+    tracking_root_pos(keypoint_pos_tracking_product):
+      body_names: [pelvis_link]
+      weight: 0.5
+      sigma: 0.5
+    tracking_root_ori(keypoint_ori_tracking_product):
+      body_names: [pelvis_link]
+      weight: 0.5
+      sigma: 0.5
+    tracking_body_linvel(keypoint_lin_vel_tracking_product):
+      body_names: [pelvis_link, .*_hip_roll_link, .*_knee_link, .*_ankle_roll_link, waist_yaw_link, .*_shoulder_roll_link, .*_elbow_link, .*_wrist_roll_link]
+      weight: 0.5
+      sigma: 0.5
+    tracking_body_angvel(keypoint_ang_vel_tracking_product):
+      body_names: [pelvis_link, .*_hip_roll_link, .*_knee_link, .*_ankle_roll_link, waist_yaw_link, .*_shoulder_roll_link, .*_elbow_link, .*_wrist_roll_link]
+      weight: 0.5
+      sigma: 2.5
+    joint_pos_tracking_product:
+      joint_names: [.*_hip_.*_joint, .*_knee_joint, .*_ankle_.*_joint, waist_(roll|yaw)_joint, .*_shoulder_.*_joint, .*_elbow_joint, .*_wrist_roll_joint]
+      weight: 0.5
+      sigma: 0.5
+    joint_vel_tracking_product:
+      joint_names: [.*_hip_.*_joint, .*_knee_joint, .*_ankle_.*_joint, waist_(roll|yaw)_joint, .*_shoulder_.*_joint, .*_elbow_joint, .*_wrist_roll_joint]
+      weight: 0.5
+      sigma: 2.0
+  debug:
+    root_pos_error(keypoint_pos_error):
+      body_names: [pelvis_link]
+      weight: 1.0
+      enabled: false
+    root_ori_error(keypoint_ori_error):
+      body_names: [pelvis_link]
+      weight: 1.0
+      enabled: false
+    body_pos_error_local(keypoint_pos_error_local):
+      body_names: [.*_hip_roll_link, .*_knee_link, .*_ankle_roll_link, .*_shoulder_roll_link, .*_elbow_link, .*_wrist_roll_link]
+      weight: 1.0
+      enabled: false
+    body_ori_error_local(keypoint_ori_error_local):
+      body_names: [.*_hip_roll_link, .*_knee_link, .*_ankle_roll_link, .*_shoulder_roll_link, .*_elbow_link, .*_wrist_roll_link]
+      weight: 1.0
+      enabled: false
+    joint_pos_error:
+      joint_names: [.*_hip_.*_joint, .*_knee_joint, .*_ankle_.*_joint, waist_(roll|yaw)_joint, .*_shoulder_.*_joint, .*_elbow_joint, .*_wrist_roll_joint]
+      weight: 1.0
+      enabled: false
+
+randomization:
+  perturb_body_materials:
+    body_names: [.*ankle_roll_link, .*wrist_roll_link]
+    static_friction_range: [0.3, 1.6]
+    dynamic_friction_range: [0.3, 1.2]
+    restitution_range: [0.0, 0.2]
+  perturb_body_com:
+    body_names: [pelvis_link, waist_yaw_link]
+    com_range: [-0.02, 0.02]
+
+termination:
+  cum_body_pos_error: {body_names: waist_yaw_link, min_steps: 25, threshold: 0.5}
+  cum_body_ori_error: {body_names: waist_yaw_link, min_steps: 25, threshold: 1.2}
+

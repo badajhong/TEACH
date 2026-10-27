@@ -102,6 +102,7 @@ class GroupedRayCasterCamera(RayCasterCamera, GroupedRayCaster):
         self.num_rays = self.ray_directions.shape[1]
         # create buffer to store ray hits
         self.ray_hits_w = torch.zeros(self._view.count, self.num_rays, 3, device=self._device)
+        self.ray_hit_mask = torch.zeros(self._view.count, self.num_rays, dtype=torch.bool, device=self._device)
         # set offsets
         quat_w = math_utils.convert_camera_frame_orientation_convention(
             torch.tensor([self.cfg.offset.rot], device=self._device), origin=self.cfg.offset.convention, target="world"
@@ -144,8 +145,18 @@ class GroupedRayCasterCamera(RayCasterCamera, GroupedRayCaster):
 
         mesh_transforms, mesh_inv_transforms = self._get_mesh_transforms_and_inv_transforms()
 
+        raycast_max_dist = self.cfg.max_distance * 2
+        if self.cfg.cover_full_image_plane_depth:
+            # Depth is measured on the camera's image plane (+X), while Warp
+            # limits travel along each unit ray. The R1's wide edge pixels need
+            # a longer ray to reach the configured image-plane depth.
+            min_forward = self.ray_directions[env_ids, :, 0].min().item()
+            if min_forward <= 0.0:
+                raise ValueError("Camera ray directions must point into the +X hemisphere.")
+            raycast_max_dist = self.cfg.max_distance / min_forward + 1e-4
+
         mesh_wp = [i for i in GroupedRayCaster.meshes.values()][0]
-        self.ray_hits_w, ray_depth, ray_normal, _, _ = raycast_mesh_grouped(
+        ray_hits_w, ray_depth, ray_normal, _, _ = raycast_mesh_grouped(
             mesh_wp_device=mesh_wp.device,
             mesh_wp_ids=self._mesh_wp_ids,
             mesh_transforms=mesh_transforms,
@@ -155,17 +166,19 @@ class GroupedRayCasterCamera(RayCasterCamera, GroupedRayCaster):
             meah_idxs_slice_for_group=self._meah_idxs_slice_for_group,
             ray_starts=self._ray_starts_w[env_ids],
             ray_directions=self._ray_directions_w[env_ids],
-            max_dist=self.cfg.max_distance * 2,  # in case of distance_to_image_plane and ray distance ambiguity
+            max_dist=raycast_max_dist,
             min_dist=self.cfg.min_distance,
             return_distance=True,
             return_normal=True,
         )
         assert ray_depth is not None
         assert ray_normal is not None
+        self.ray_hits_w[env_ids] = ray_hits_w
+        self.ray_hit_mask[env_ids] = torch.isfinite(ray_depth)
 
         # update output buffers
         if "distance_to_image_plane" in self.cfg.data_types:
-            # note: data is in camera frame so we only take the first component (z-axis of camera frame)
+            # In the configured world convention, camera +X is the optical axis.
             distance_to_image_plane = (
                 math_utils.quat_apply(
                     math_utils.quat_inv(self._data.quat_w_world[env_ids]).repeat(1, self.num_rays),

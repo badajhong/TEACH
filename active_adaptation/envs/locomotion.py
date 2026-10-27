@@ -174,6 +174,20 @@ class SimpleEnv(_Env):
                         asset.spawn.randomize_source_scale = body_scale_rand.get("randomize_source_scale", False)
                         print(f"Randomized {name} scale to {asset.spawn.scale_range}")
 
+            camera_sensor = self.cfg.get("camera_sensor", {})
+            depth_proxy_usd = camera_sensor.get("object_depth_proxy_usd", None)
+            if self.cfg.get("enable_cameras", False) and depth_proxy_usd is not None:
+                if "object_asset_name" not in self.cfg.command:
+                    raise ValueError("object_depth_proxy_usd requires a tracked object")
+                proxy_path = os.path.join(os.path.dirname(active_adaptation.__file__), "assets", depth_proxy_usd)
+                if not os.path.isfile(proxy_path):
+                    raise FileNotFoundError(proxy_path)
+                scene_cfg.depth_object_proxy = AssetBaseCfg(
+                    prim_path=(f"{{ENV_REGEX_NS}}/{self.cfg.command.object_asset_name}/"
+                               f"{self.cfg.command.object_body_name}/DepthProxy"),
+                    spawn=sim_utils.UsdFileCfg(usd_path=proxy_path, visible=False),
+                )
+
             scene_cfg.terrain = TERRAINS[self.cfg.terrain]
             scene_cfg.contact_forces = ContactSensorCfg(
                 prim_path="{ENV_REGEX_NS}/Robot/.*(ankle_roll|wrist_.*)_link", 
@@ -186,6 +200,9 @@ class SimpleEnv(_Env):
                 from active_adaptation.sensors import NoisyGroupedRayCasterCameraCfg
                 from isaaclab.sensors.ray_caster import patterns, MultiMeshRayCasterCfg
 
+                visuals_only = camera_sensor.get("raycast_visuals_only", False)
+                robot_mesh_suffix = "/visuals" if visuals_only else ""
+
                 # Build mesh_prim_paths: ground (static, no transform tracking) + per-env objects (dynamic)
                 mesh_prim_paths = [
                     MultiMeshRayCasterCfg.RaycastTargetCfg(
@@ -195,13 +212,13 @@ class SimpleEnv(_Env):
                     ),
                     # Robot links — needed so the camera can "see" the robot's own hands and legs
                     MultiMeshRayCasterCfg.RaycastTargetCfg(
-                        prim_expr="{ENV_REGEX_NS}/Robot/.*(hip_.*|wrist_.*|shoulder_.*)_link",
-                        is_shared=False,
+                        prim_expr=f"{{ENV_REGEX_NS}}/Robot/.*(hip_.*|wrist_.*|shoulder_.*)_link{robot_mesh_suffix}",
+                        is_shared=visuals_only,
                         track_mesh_transforms=True,
                     ),
                     MultiMeshRayCasterCfg.RaycastTargetCfg(
-                        prim_expr="{ENV_REGEX_NS}/Robot/.*elbow_link",
-                        is_shared=False,
+                        prim_expr=f"{{ENV_REGEX_NS}}/Robot/.*elbow_link{robot_mesh_suffix}",
+                        is_shared=visuals_only,
                         track_mesh_transforms=True,
                     ),
                 ]
@@ -209,9 +226,14 @@ class SimpleEnv(_Env):
                 # Add object if present — each env has its own moving object
                 if "object_asset_name" in self.cfg.command:
                     obj_name = self.cfg.command.object_asset_name
+                    object_mesh_path = f"{{ENV_REGEX_NS}}/{obj_name}"
+                    if depth_proxy_usd is not None:
+                        object_mesh_path += f"/{self.cfg.command.object_body_name}/DepthProxy"
+                    elif visuals_only:
+                        object_mesh_path += f"/{self.cfg.command.object_body_name}/visuals"
                     mesh_prim_paths.append(
                         MultiMeshRayCasterCfg.RaycastTargetCfg(
-                            prim_expr=f"{{ENV_REGEX_NS}}/{obj_name}",
+                            prim_expr=object_mesh_path,
                             is_shared=False,
                             track_mesh_transforms=True,
                         )
@@ -228,35 +250,42 @@ class SimpleEnv(_Env):
                             )
                         )
 
-                # Use NoisyGroupedRayCasterCamera to support multiple mesh targets
+                # Use NoisyGroupedRayCasterCamera to support multiple mesh targets.
+                # Tasks may override the mount and optics; the defaults retain the G1 setup.
                 camera_dr = self.cfg.get("camera_dr", {})
                 ray_camera = NoisyGroupedRayCasterCameraCfg(
-                    prim_path="{ENV_REGEX_NS}/Robot/torso_link",
+                    prim_path=f"{{ENV_REGEX_NS}}/Robot/{camera_sensor.get('parent_link', 'torso_link')}",
                     mesh_prim_paths=mesh_prim_paths,  # type: ignore[arg-type]
                     offset=NoisyGroupedRayCasterCameraCfg.OffsetCfg(
-                        # D435 camera position relative to torso_link
-                        pos=(0.04764571478 + 0.0039635 - 0.0042 * math.cos(math.radians(48)),  # 0.0487988662332928
-                             0.015,
-                             0.46268178553 - 0.044 + 0.0042 * math.sin(math.radians(48)) + 0.016), # 0.4378029937970051
-                        rot=(math.cos(math.radians(0.5) / 2) * math.cos(math.radians(48) / 2),  # 0.9135367613482678
-                             math.sin(math.radians(0.5) / 2), # 0.004363309284746571
-                             math.sin(math.radians(48) / 2), # 0.4067366430758002
-                             0.0),  # ~47.6 degree pitch down
+                        pos=tuple(camera_sensor.get("offset_pos", (
+                            0.04764571478 + 0.0039635 - 0.0042 * math.cos(math.radians(48)),
+                            0.015,
+                            0.46268178553 - 0.044 + 0.0042 * math.sin(math.radians(48)) + 0.016,
+                        ))),
+                        rot=tuple(camera_sensor.get("offset_rot", (
+                            math.cos(math.radians(0.5) / 2) * math.cos(math.radians(48) / 2),
+                            math.sin(math.radians(0.5) / 2),
+                            math.sin(math.radians(48) / 2),
+                            0.0,
+                        ))),
                         convention="world",
                     ),
                     ray_alignment="yaw",
                     pattern_cfg=patterns.PinholeCameraPatternCfg(
                         focal_length=1.0,
-                        horizontal_aperture=2*math.tan(math.radians(90.05)/2),  # 87° FOVx (D435 spec)
-                        vertical_aperture=2*math.tan(math.radians(58.76)/2),    # 58° FOVy (D435 spec)
+                        horizontal_aperture=2*math.tan(math.radians(camera_sensor.get("horizontal_fov_deg", 90.05))/2),
+                        vertical_aperture=2*math.tan(math.radians(camera_sensor.get("vertical_fov_deg", 58.76))/2),
                         height=self.cfg.camera_height,
                         width=self.cfg.camera_width,
                     ),
                     data_types=["distance_to_image_plane"],
-                    update_period=0.02,
+                    update_period=camera_sensor.get("update_period", 0.02),
                     debug_vis=self.cfg.get("debug_vis", False),
-                    min_distance=0.1,
-                    max_distance=4.0,
+                    min_distance=camera_sensor.get("min_distance", 0.1),
+                    max_distance=camera_sensor.get("max_distance", 4.0),
+                    depth_clipping_behavior=camera_sensor.get("depth_clipping_behavior", "none"),
+                    cover_full_image_plane_depth=camera_sensor.get("cover_full_image_plane_depth", False),
+                    use_per_env_mesh_ids=camera_sensor.get("use_per_env_mesh_ids", False),
                     # extrinsics DR
                     extrinsics_pos_noise_std=tuple(camera_dr.get("extrinsics_pos_noise_std", [0.0, 0.0, 0.0])),
                     extrinsics_rot_noise_std=tuple(camera_dr.get("extrinsics_rot_noise_std", [0.0, 0.0, 0.0])),
@@ -385,6 +414,7 @@ class SimpleEnv(_Env):
         if cam is not None and hasattr(cam, "data") and hasattr(cam.data, "pos_w"):
             # Visualize rays for all environments
             num_envs = cam.data.pos_w.shape[0]
+            hits_only = self.cfg.get("camera_sensor", {}).get("visualize_hits_only", False)
 
             for env_id in range(num_envs):
                 # Camera position in world frame
@@ -392,6 +422,18 @@ class SimpleEnv(_Env):
 
                 # Ray hit points in world frame
                 ray_hits = cam.ray_hits_w[env_id]  # [num_rays, 3]
+                if hits_only:
+                    # Draw only actual intersections within this camera's range.
+                    ray_distance = torch.linalg.vector_norm(ray_hits - cam_pos, dim=-1)
+                    valid = (
+                        cam.ray_hit_mask[env_id]
+                        & torch.isfinite(ray_hits).all(dim=-1)
+                        & (ray_distance >= cam.cfg.min_distance)
+                        & (ray_distance <= cam.cfg.max_distance)
+                    )
+                    ray_hits = ray_hits[valid]
+                    if ray_hits.numel() == 0:
+                        continue
 
                 # Draw lines from camera position to hit points using red color
                 self.debug_draw.vector(

@@ -1,0 +1,12 @@
+# @package task
+defaults:
+  - /task/R1/rl/smalltable_base
+  - _self_
+
+name: R1RlSub17Smalltable014
+
+command:
+  data_path: data/motion/r1/rl/smalltable/sub17_smalltable_014
+  contact_target_pos_offset:
+    - [-0.1736, 0.0599, 0.1075]
+    - [0.1695, 0.0538, 0.1504]
