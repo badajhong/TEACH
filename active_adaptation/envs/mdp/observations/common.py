@@ -106,6 +106,8 @@ class joint_pos_history(Observation):
         joint_pos2 = self.asset.data.joint_pos[env_ids][:, self.joint_ids]
         assert torch.allclose(joint_pos, joint_pos2)
         self.buffer[env_ids] = self.asset.data.joint_pos[env_ids.unsqueeze(1), self.joint_ids.unsqueeze(0)].unsqueeze(1)
+        if self.env.real_reset_observations:
+            self.joint_pos[env_ids] = joint_pos.unsqueeze(1)
     
     def update(self):
         self.buffer = self.buffer.roll(1, 1)
@@ -279,6 +281,7 @@ class depth_camera(Observation):
         self.nan_to_num = nan_to_num
         self.num_bins = num_bins
         self.dropout_prob = dropout_prob
+        self.initialize_reset_history = self.env.real_reset_observations
 
         # step noise
         self.noise_std = noise_std
@@ -308,6 +311,12 @@ class depth_camera(Observation):
     
     def reset(self, env_ids):
         # resample DR parameters
+        if self.initialize_reset_history:
+            # Current-mode observation resets run after forward kinematics.
+            # Sensor reset has marked these rows stale, so .data casts a fresh
+            # image at the new pose. Seed only this episode's delayed history.
+            image = self.camera.data.output["distance_to_image_plane"].squeeze(-1)
+            self.depth_img_buffer[env_ids] = image[env_ids].unsqueeze(1)
         with torch.device(self.device):
             self.gaussian_filter_sigma[env_ids] = torch.empty(len(env_ids)).uniform_(*self.gaussian_filter_sigma_range)
 
@@ -324,10 +333,16 @@ class depth_camera(Observation):
             )
     
     def compute(self) -> torch.Tensor:
-        depth_img_current = self.camera.data.output["distance_to_image_plane"].squeeze(-1)  # [N, H, W]
-        # update the depth image buffer with the latest depth image
-        self.depth_img_buffer = self.depth_img_buffer.roll(1, dims=1)
-        self.depth_img_buffer[:, 0] = depth_img_current
+        return self._compute_depth()
+
+    def compute_on_reset(self, env_ids) -> torch.Tensor:
+        return self._compute_depth(update_history=False)
+
+    def _compute_depth(self, update_history=True) -> torch.Tensor:
+        if update_history:
+            depth_img_current = self.camera.data.output["distance_to_image_plane"].squeeze(-1)
+            self.depth_img_buffer = self.depth_img_buffer.roll(1, dims=1)
+            self.depth_img_buffer[:, 0] = depth_img_current
         depth_img = self.depth_img_buffer[self.all_env_ids, self.delay, :, :]
         
         # TODO: does not support different kernel sizes and sigmas for each environment, not batched

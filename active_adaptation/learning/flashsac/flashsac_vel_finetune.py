@@ -431,7 +431,7 @@ class FlashSACVelFinetune(FlashSACVel):
             self._allocate_student_replay()
         # After the first row, the preceding next_obs already occupies this slot.
         current_obs = (self._student_replay_obs(td, td[PRIV_PRED_KEY])
-                       if self.buffer.step == 0 else None)
+                       if self.buffer.step == 0 or self.real_reset_observations else None)
         terminated = next_td["terminated"].squeeze(-1)
         truncated = next_td["truncated"].squeeze(-1)
         cut = terminated
@@ -442,7 +442,10 @@ class FlashSACVelFinetune(FlashSACVel):
         self.buffer.add(
             obs=current_obs, next_obs=next_obs,
             action=td[U_KEY], reward=reward, discount=next_td["discount"].squeeze(-1),
-            done=terminated | truncated, cut=cut, valid=td["step_count"].squeeze(-1) > 1,
+            done=terminated | truncated, cut=cut,
+            valid=(torch.ones_like(terminated) if self.real_reset_observations
+                   else td["step_count"].squeeze(-1) > 1),
+            reset_mask=td["is_init"].squeeze(-1) if self.real_reset_observations else None,
         )
         if self.reward_normalizer is not None:
             self.reward_normalizer.update_reward_stats(reward, terminated, truncated)
@@ -612,7 +615,8 @@ class FlashSACVelFinetune(FlashSACVel):
         for _ in range(self.cfg.adapt_epochs):
             for batch in make_batch(rollout, self.cfg.adapt_num_minibatches, self.cfg.train_every):
                 self._perceive(batch, ema=False)
-                valid = (~batch["is_init"]).float()
+                valid = (torch.ones_like(batch["is_init"], dtype=torch.float32)
+                         if self.real_reset_observations else (~batch["is_init"]).float())
                 priv_loss = ((batch[PRIV_PRED_KEY] - batch[PRIV_FEATURE_KEY]).square() * valid).mean()
                 object_loss = ((batch[OBJECT_PRED_KEY] - batch[OBJECT_KEY]).square() * valid).mean()
                 priv_pred_norm = batch[PRIV_PRED_KEY].detach().norm(dim=-1).mean()

@@ -8,3 +8,12 @@ name: R1RlSub3Largebox003Stu
 # The joint student policy consumes depth. Keep the R1 camera's 68 x 56 rays,
 # 146 x 124 degree FOV, 0.1 s period, and 0.1-1.5 m range from rl/base.yaml.
 enable_cameras: true
+
+# Shared by train.py and play.py. Old checkpoints used zero reset observations;
+# explicitly set task.reset_observation_mode=zero to reproduce those inputs.
+reset_observation_mode: current
+
+command:
+  # Train cold GRU/depth initialization at the same full-motion start used in play.
+  # Other resets retain random motion phases; explicit reset_range takes priority.
+  full_start_probability: 0.2

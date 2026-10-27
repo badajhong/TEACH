@@ -25,6 +25,9 @@ class ActionManager:
     def debug_draw(self):
         pass
 
+    def initialize_reset_targets(self, env_ids: torch.Tensor):
+        pass
+
     @property
     def num_envs(self):
         return self.env.num_envs
@@ -141,4 +144,14 @@ class JointPosition(ActionManager):
         if self.fixed_joint_ids:
             pos_target[:, self.fixed_joint_ids] = self.default_joint_pos[:, self.fixed_joint_ids]
         self.asset.set_joint_position_target(pos_target)
+
+    def initialize_reset_targets(self, env_ids: torch.Tensor):
+        """Start delay/filter state at the target holding the teleported pose."""
+        position = self.asset.data.joint_pos[env_ids].clone()
+        held = (position[:, self.joint_ids]
+                - self.default_joint_pos[env_ids][:, self.joint_ids]
+                - self.offset[env_ids][:, self.joint_ids]) / self.action_scaling
+        self.action_buf[env_ids] = held.unsqueeze(-1)
+        self.applied_action[env_ids] = held
+        self.asset.set_joint_position_target(position, env_ids=env_ids)
         

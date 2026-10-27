@@ -35,6 +35,7 @@ class RobotTracking(Command):
         # reset parameters
         root_body_name: str = "pelvis",
         reset_range: Tuple[float, float] | None = None,
+        full_start_probability: float = 0.0,
         pose_range: Dict[str, Tuple[float, float]] = {
             "x": (-0.0, 0.0),
             "y": (-0.0, 0.0),
@@ -103,6 +104,9 @@ class RobotTracking(Command):
             self.eval_t = torch.randint(0, self.dataset.lengths[0], (self.num_envs,), device=self.device)
 
         self.reset_range = reset_range
+        if not 0.0 <= full_start_probability <= 1.0:
+            raise ValueError("full_start_probability must be between 0 and 1.")
+        self.full_start_probability = full_start_probability
 
         pose_range_list = [pose_range.get(key, (0.0, 0.0)) for key in ["x", "y", "z", "roll", "pitch", "yaw"]]
         self.pose_range = torch.tensor(pose_range_list, device=self.device)
@@ -130,7 +134,7 @@ class RobotTracking(Command):
 
         if call_update:
             self._init_debug_draw()
-            self.update()
+            self.update(advance=not self.env.real_reset_observations)
             if self.record_motion:
                 self.motion_frames = []
         
@@ -154,6 +158,9 @@ class RobotTracking(Command):
             max_len = motion_len - self.future_steps[-1]
             start_phase = torch.rand(len(env_ids), device=self.device)
             start_t = (start_phase * max_len).long()
+            if self.env.training and self.full_start_probability > 0.0:
+                full_start = torch.rand(len(env_ids), device=self.device) < self.full_start_probability
+                start_t[full_start] = 0
         else:
             start_t = torch.randint(*self.reset_range, (len(env_ids),), device=self.device)
             
@@ -248,8 +255,15 @@ class RobotTracking(Command):
             return torch.ones(self.num_envs, 1, dtype=bool, device=self.device)
         return (self.t >= self.motion_len).unsqueeze(1)
 
-    def update(self):
-        if hasattr(self, "motion_frames"):
+    def refresh_after_reset(self, env_ids: torch.Tensor):
+        # In current mode t is the current motion frame. Reading it does not
+        # advance any environment or append a recording frame.
+        self.update(advance=False)
+
+    def update(self, advance=True):
+        if advance and self.env.real_reset_observations:
+            self.t += 1
+        if advance and hasattr(self, "motion_frames"):
             motion_frame = {}
             motion_frame["body_pos_w"] = self.asset.data.body_link_pos_w.cpu()
             motion_frame["body_quat_w"] = self.asset.data.body_link_quat_w.cpu()
@@ -303,7 +317,8 @@ class RobotTracking(Command):
             # self.all_marker_pos_w[0] = self.ref_body_pos_future_w[:, 0]
             # self.all_marker_pos_w[1] = self.ref_body_pos_future_w[:, -1]
 
-        self.t += 1
+        if advance and not self.env.real_reset_observations:
+            self.t += 1
     
     def _init_debug_draw(self):
         if self.env.backend != "isaac":
@@ -642,7 +657,7 @@ class RobotObjectTracking(RobotTracking):
                     object_.write_root_link_pose_to_sim(state[:, 0:7], env_ids=no_extra_envs)
                     object_.write_root_com_velocity_to_sim(state[:, 7:], env_ids=no_extra_envs)
 
-        self.update()
+        self.update(advance=not self.env.real_reset_observations)
         if self.record_motion:
             self.motion_frames = []
 
@@ -832,9 +847,9 @@ class RobotObjectTracking(RobotTracking):
         print(f"Saved recorded motion to {motion_data_path} and {motion_meta_path}")
         breakpoint()
 
-    def update(self):
-        super().update()
-        if hasattr(self, "motion_frames"):
+    def update(self, advance=True):
+        super().update(advance=advance)
+        if advance and hasattr(self, "motion_frames"):
             motion_frame = self.motion_frames[-1]
             # add object data to the motion frame
             object_pos_w = self.object.data.body_link_pos_w[:, self.object_body_id_asset].cpu()

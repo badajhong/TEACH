@@ -47,6 +47,60 @@ class JointFinetuneTest(unittest.TestCase):
         for _ in range(self.policy.cfg.train_every):
             self.joint_step()
 
+    def test_current_reset_states_train_perception_and_first_action(self):
+        self.env.real_reset_observations = True
+        observation = self.observation
+
+        def initial_observation():
+            td = observation()
+            td["is_init"].fill_(True)
+            td["step_count"].zero_()
+            return td
+
+        self.observation = initial_observation
+        self.joint_iteration()
+        self.assertTrue(self.policy.buffer.valid[:4].all())
+        self.assertIn(1, self.policy.buffer._reset_obs)
+        info = self.policy.pop_info()
+        self.assertGreater(info["adapt/priv_loss"], 0.)
+        self.assertGreater(info["adapt/object_loss"], 0.)
+
+    def test_legacy_reset_placeholders_remain_excluded(self):
+        observation = self.observation
+
+        def initial_observation():
+            td = observation()
+            td["is_init"].fill_(True)
+            td["step_count"].zero_()
+            return td
+
+        self.observation = initial_observation
+        self.joint_iteration()
+        self.assertFalse(self.policy.buffer.valid[:4].any())
+        info = self.policy.pop_info()
+        self.assertEqual(info["adapt/priv_loss"], 0.)
+        self.assertEqual(info["adapt/object_loss"], 0.)
+
+    def test_current_reset_states_are_supervised_during_teacher_warmup(self):
+        self.env.real_reset_observations = True
+        self.policy = self.new_policy(perception_iters=1)
+        self.policy.load_state_dict(self.teacher_state)
+        observation = self.observation
+
+        def initial_observation():
+            td = observation()
+            td["is_init"].fill_(True)
+            td["step_count"].zero_()
+            return td
+
+        self.observation = initial_observation
+        self.perception_iteration()
+        info = self.policy.pop_info()
+        self.assertGreater(info["adapt/priv_loss"], 0.)
+        self.assertGreater(info["adapt/object_loss"], 0.)
+        self.assertEqual(self.policy.stage, 2)
+        self.assertTrue(self.policy.needs_env_reset)
+
     def test_starts_joint_and_perception_trains_while_replay_fills(self):
         p = self.policy
         self.assertEqual(p.stage, 2)

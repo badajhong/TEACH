@@ -106,6 +106,10 @@ class ObsGroup:
             tensors.append(tensor)
             # print(f"\t{obs_key}: {tensor.shape}")
         return torch.cat(tensors, dim=-1)
+
+    def compute_on_reset(self, tensordict, env_ids):
+        values = torch.cat([obs.compute_on_reset(env_ids) for obs in self.funcs.values()], dim=-1)
+        tensordict[self.name][env_ids] = values[env_ids]
     
     def symmetry_transforms(self):
         transforms = []
@@ -122,12 +126,21 @@ class _Env(EnvBase):
     2024.10.10
     - disable delay
     - refactor flipping
-    - no longer recompute observation upon reset
+    - zero reset observations are retained as the legacy mode
+
+    reset_observation_mode=current returns synchronized observations before the
+    first action; train and play must use the same mode.
 
     """
     def __init__(self, cfg):
         self.cfg = cfg
         self.backend = active_adaptation.get_backend()
+        self.reset_observation_mode = cfg.get("reset_observation_mode", "zero")
+        if self.reset_observation_mode not in ("zero", "current"):
+            raise ValueError("reset_observation_mode must be 'zero' or 'current'.")
+        self.real_reset_observations = self.reset_observation_mode == "current"
+        if self.real_reset_observations and self.backend != "isaac":
+            raise ValueError("Current reset observations require the Isaac backend.")
 
         self.scene: InteractiveScene
         self.setup_scene()
@@ -187,6 +200,7 @@ class _Env(EnvBase):
         self._update_callbacks = []
         self._perf_ema_update = {}
         self._reset_callbacks = []
+        self._observation_reset_callbacks = []
         self._debug_draw_callbacks = []
         self._pre_step_callbacks = []
         self._post_step_callbacks = []
@@ -242,6 +256,7 @@ class _Env(EnvBase):
                 self._startup_callbacks.append(obs.startup)
                 self._update_callbacks.append(obs.update)
                 self._reset_callbacks.append(obs.reset)
+                self._observation_reset_callbacks.append(obs.reset)
                 self._debug_draw_callbacks.append(obs.debug_draw)
                 self._post_step_callbacks.append(obs.post_step)
             
@@ -334,6 +349,14 @@ class _Env(EnvBase):
         self.termination_time = 0.
         self.observation_time = 0.
         self.ema_cnt = 0.
+
+        # Finalize startup physics-property writes before teleporting into motion.
+        # No motion time or policy action is consumed here.
+        if self.backend == "isaac":
+            for _ in range(self.cfg.sim.get("startup_physics_steps", 0)):
+                self.scene.write_data_to_sim()
+                self.sim.step(render=False)
+                self.scene.update(self.physics_dt)
         
     def set_progress(self, progress: int):
         self.current_iter = progress
@@ -386,10 +409,23 @@ class _Env(EnvBase):
             self._reset_idx(env_ids)
             self.scene.reset(env_ids)
         self.episode_length_buf[env_ids] = 0
+        observation_callbacks = set(self._observation_reset_callbacks)
         for callback in self._reset_callbacks:
+            if self.real_reset_observations and callback in observation_callbacks:
+                continue
             callback(env_ids)
         tensordict = TensorDict({}, self.num_envs, device=self.device)
         tensordict.update(self.observation_spec.zero())
+        if self.real_reset_observations and len(env_ids):
+            self.action_manager.initialize_reset_targets(env_ids)
+            self.scene.write_data_to_sim()
+            self.sim.forward()
+            self.scene.update(0.0)
+            self.command_manager.refresh_after_reset(env_ids)
+            for callback in self._observation_reset_callbacks:
+                callback(env_ids)
+            for group in self.observation_funcs.values():
+                group.compute_on_reset(tensordict, env_ids)
         end = time.perf_counter()
         self.reset_time = self.reset_time * self._stats_ema_decay + (end - start)
         return tensordict

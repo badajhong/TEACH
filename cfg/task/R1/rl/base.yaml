@@ -26,6 +26,10 @@ camera_sensor:
   cover_full_image_plane_depth: true
   visualize_hits_only: true
 num_envs: 4096
+reset_observation_mode: zero # Legacy teachers; student tasks select current.
+
+sim:
+  startup_physics_steps: 1
 
 viewer:
   env_spacing: 5.0

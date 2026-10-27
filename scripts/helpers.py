@@ -135,6 +135,15 @@ def make_env_policy(cfg: DictConfig):
     if checkpoint_path is not None:
         state_dict = torch.load(checkpoint_path, weights_only=False)
         saved_cfg = state_dict.get("cfg") or {}
+        saved_reset_mode = (saved_cfg.get("task") or {}).get("reset_observation_mode", "zero")
+        if saved_reset_mode != base_env.reset_observation_mode:
+            logging.warning(
+                "Checkpoint reset_observation_mode=%s, current task=%s. "
+                "Initial observations, depth history, and reference timing differ. "
+                "For legacy evaluation use task.reset_observation_mode=%s; "
+                "train and evaluate new models with the same reset mode.",
+                saved_reset_mode, base_env.reset_observation_mode, saved_reset_mode,
+            )
         saved_action = (saved_cfg.get("task") or {}).get("action") or {}
         current_action = cfg.task.get("action", {})
         differences = {

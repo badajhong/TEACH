@@ -665,14 +665,16 @@ class FlashSACVel(FlashSACVelFlat):
         if not self.cfg.bootstrap_on_command_finished:
             cut = cut | (truncated & ~time_limit)
         self.buffer.add(
-            obs=current_replay if self.buffer.step == 0 else None,
+            obs=current_replay if self.buffer.step == 0 or self.real_reset_observations else None,
             next_obs=next_replay,
             action=tensordict[U_KEY],
             reward=reward,
             discount=next_td["discount"].squeeze(-1),
             done=terminated | truncated,
             cut=cut,
-            valid=tensordict["step_count"].squeeze(-1) > 1,
+            valid=(torch.ones_like(terminated) if self.real_reset_observations
+                   else tensordict["step_count"].squeeze(-1) > 1),
+            reset_mask=tensordict["is_init"].squeeze(-1) if self.real_reset_observations else None,
         )
         if self.reward_normalizer is not None:
             self.reward_normalizer.update_reward_stats(reward, terminated, truncated)
@@ -746,19 +748,21 @@ class FlashSACVel(FlashSACVelFlat):
                     teacher_action = self.cfg.action_scale * teacher_u
 
             minibatch[PRIV_FEATURE_KEY] = priv_feature
+            valid = (torch.ones_like(minibatch["is_init"]) if self.real_reset_observations
+                     else ~minibatch["is_init"])
             minibatch[DEPTH_FEATURE_KEY] = torch.zeros(
                 *batch_shape, self.depth_feature_dim, device=self.device
             )
             if self.cfg.use_object_adapt:
                 self.object_adapt(minibatch)
                 object_loss = (minibatch[OBJECT_PRED_KEY] - minibatch[OBJECT_KEY]).square()
-                object_loss = (object_loss * (~minibatch["is_init"])).mean()
+                object_loss = (object_loss * valid).mean()
             else:
                 object_loss = torch.zeros((), device=self.device)
 
             self.adapt_module(minibatch)
             priv_loss = (minibatch[PRIV_PRED_KEY] - priv_feature).square()
-            priv_loss = (priv_loss * (~minibatch["is_init"])).mean()
+            priv_loss = (priv_loss * valid).mean()
             priv_pred_norm = minibatch[PRIV_PRED_KEY].detach().norm(p=2, dim=-1).mean()
             total_loss = priv_loss + object_loss
             self.opt_adapt.zero_grad()

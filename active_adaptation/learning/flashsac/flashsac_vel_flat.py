@@ -202,9 +202,10 @@ class NStepTrajectoryReplay:
     from that step's next observation. Unlike upstream, each observation is stored once,
     in per-env time order, so the next observation of row t is the one in slot t+1.
 
-    VAIC does not recompute observations on reset, so on the step after a reset the env
-    carries a placeholder observation. That slot is filled with the true final observation
-    of the finished episode instead, and the row itself is never sampled.
+    The slot after an episode end keeps its terminal observation for bootstrapping.
+    For environments returning real reset observations, a sparse cache holds the
+    different initial observation at that same slot. This makes initial actions
+    trainable without replacing terminal observations or doubling replay storage.
 
     Observations may be stored in a lower precision (`obs_dtype`); sampled batches are float32.
     With `storage_device="cpu"` the data lives in RAM and each batch is gathered into pinned
@@ -242,6 +243,8 @@ class NStepTrajectoryReplay:
             self.valid = torch.zeros(shape, dtype=torch.bool)  # the row may start a transition
             self.weight = torch.zeros(shape)  # 1 where the row can be sampled right now
         self.step = 0  # global index of the next row
+        self._reset_rows = None
+        self._reset_obs = {}
         if self.storage.type == "cpu" and self.device.type == "cuda":
             # reused pinned staging buffers and a separate stream, so copies do not queue behind the
             # training kernels and each batch lands in memory that is already mapped
@@ -262,7 +265,10 @@ class NStepTrajectoryReplay:
 
     def nbytes(self) -> int:
         tensors = (self.obs, self.action, self.reward, self.discount, self.done, self.cut, self.valid, self.weight)
-        return sum(t.numel() * t.element_size() for t in tensors)
+        size = sum(t.numel() * t.element_size() for t in tensors)
+        if self._reset_rows is not None:
+            size += self._reset_rows.numel() * self._reset_rows.element_size()
+        return size + sum(t.numel() * t.element_size() for pair in self._reset_obs.values() for t in pair)
 
     def __len__(self) -> int:
         """Rows whose n-step window is complete, like upstream's count of emitted transitions."""
@@ -272,12 +278,28 @@ class NStepTrajectoryReplay:
     def can_sample(self) -> bool:
         return len(self) >= self.min_length
 
-    def add(self, obs, next_obs, action, reward, discount, done, cut, valid):
+    def add(self, obs, next_obs, action, reward, discount, done, cut, valid, reset_mask=None):
         g, T = self.step, self.T
         s = g % T
+        # Both the overwritten transition and the overwritten next-observation
+        # slot lose their sparse initial observation on ring wraparound.
+        if self._reset_rows is not None:
+            for row in (s, (s + 1) % T):
+                self._reset_rows[row] = False
+                self._reset_obs.pop(row, None)
         next_obs = next_obs.to(self.obs.dtype)  # cast before a possible copy to RAM
         if g == 0:
             self.obs[s] = obs.to(self.obs.dtype)
+        elif reset_mask is not None:
+            ids = reset_mask.to(self.storage).reshape(-1).nonzero().squeeze(-1)
+            if ids.numel():
+                if obs is None:
+                    raise ValueError("Real reset transitions require current observations.")
+                if self._reset_rows is None:
+                    self._reset_rows = torch.zeros_like(self.valid)
+                values = obs[ids.to(obs.device)].to(device=self.storage, dtype=self.obs.dtype, copy=True)
+                self._reset_rows[s, ids] = True
+                self._reset_obs[s] = (ids, values)
         self.action[s] = action
         self.reward[s] = reward
         self.discount[s] = discount
@@ -346,10 +368,13 @@ class NStepTrajectoryReplay:
             parts.append(1.0 - one_step_cont[:, None])
         if self.storage == self.device:
             obs, rest = obs_rows.index_select(0, rows), torch.cat(parts, dim=1)
+            self._restore_reset_observations(obs, t, env)
         elif hasattr(self, "_staging") and B == self.batch_size:
-            obs, rest = self._to_device(obs_rows, rows, parts)
+            obs, rest = self._to_device(obs_rows, rows, parts, t, env)
         else:  # batches of other sizes (tests) take the plain path
-            obs, rest = obs_rows.index_select(0, rows).to(self.device), torch.cat(parts, dim=1).to(self.device)
+            obs = obs_rows.index_select(0, rows)
+            self._restore_reset_observations(obs, t, env)
+            obs, rest = obs.to(self.device), torch.cat(parts, dim=1).to(self.device)
         obs = obs.float()
         A = self.action.shape[-1]
         batch = {
@@ -364,11 +389,23 @@ class NStepTrajectoryReplay:
             batch["one_step_terminated"] = rest[:, A + 2].contiguous()
         return batch
 
-    def _to_device(self, obs_rows, rows, parts):
+    def _restore_reset_observations(self, obs, t, env):
+        if self._reset_rows is None:
+            return
+        initial = self._reset_rows[t, env]
+        # Patch only the current-state block. Next-state blocks must retain the
+        # finished episode's final observation, including at soft truncations.
+        for row in t[initial].unique().tolist():
+            positions = (initial & (t == row)).nonzero().squeeze(-1)
+            ids, values = self._reset_obs[row]
+            obs[positions] = values[torch.searchsorted(ids, env[positions])]
+
+    def _to_device(self, obs_rows, rows, parts, t, env):
         obs_pinned, rest_pinned, copied = self._staging[self._staging_index]
         self._staging_index = (self._staging_index + 1) % len(self._staging)
         copied.synchronize()  # the copy that last read this staging slot is done (normally long ago)
         torch.index_select(obs_rows, 0, rows, out=obs_pinned)
+        self._restore_reset_observations(obs_pinned, t, env)
         torch.cat(parts, dim=1, out=rest_pinned)
         with torch.cuda.stream(self._copy_stream):
             obs = obs_pinned.to(self.device, non_blocking=True)
@@ -459,6 +496,11 @@ def _raw(network):
 
 class FlashSACVelFlat(TensorDictModuleBase):
     is_off_policy = True
+
+    @property
+    def real_reset_observations(self):
+        base = getattr(self.env, "base_env", self.env)
+        return bool(getattr(base, "real_reset_observations", False))
 
     def __init__(self, cfg: FlashSACVelFlatConfig, observation_spec, action_spec, reward_spec, device, env):
         super().__init__()
@@ -727,15 +769,16 @@ class FlashSACVelFlat(TensorDictModuleBase):
         if not self.cfg.bootstrap_on_command_finished:
             cut = cut | (truncated & ~time_limit)
         self.buffer.add(
-            obs=self.flat_obs(tensordict) if self.buffer.step == 0 else None,
+            obs=self.flat_obs(tensordict) if self.buffer.step == 0 or self.real_reset_observations else None,
             next_obs=self.flat_obs(next_td),
             action=tensordict[U_KEY],
             reward=reward,
             discount=next_td["discount"].squeeze(-1),
             done=terminated | truncated,
             cut=cut,
-            # the first two steps of an episode are invalid, as in PPOVEL (step_count > 1)
-            valid=tensordict["step_count"].squeeze(-1) > 1,
+            valid=(torch.ones_like(terminated) if self.real_reset_observations
+                   else tensordict["step_count"].squeeze(-1) > 1),
+            reset_mask=tensordict["is_init"].squeeze(-1) if self.real_reset_observations else None,
         )
         if self.reward_normalizer is not None:
             self.reward_normalizer.update_reward_stats(reward=reward, terminated=terminated, truncated=truncated)

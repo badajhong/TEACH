@@ -73,6 +73,10 @@ class Command:
     def update(self):
         pass
 
+    def refresh_after_reset(self, env_ids: torch.Tensor):
+        """Refresh commands without consuming a control step (override if stateful)."""
+        pass
+
     def reset(self, env_ids: torch.Tensor):
         pass
 
@@ -156,6 +160,10 @@ class Observation(Generic[CT], _RegistryMixin):
     def __call__(self) ->  Tuple[torch.Tensor, torch.Tensor]:
         tensor = self.compute()
         return tensor
+
+    def compute_on_reset(self, env_ids: torch.Tensor) -> torch.Tensor:
+        """Read observations without advancing histories of other environments."""
+        return self.compute()
     
     def startup(self):
         """Called once upon initialization of the environment"""
