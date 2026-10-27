@@ -1,8 +1,7 @@
 """R1 robot and interaction-object assets used by R1 tracking tasks.
 
-The heavy USD layers stay in the neighboring HOI checkout.  Set
-``VAIC_HOI_ROOT`` when that checkout is located somewhere other than the
-default path used on this workstation.
+The USD layers live in this repository under ``data/motion/r1/robot`` and
+``data/motion/r1/objects``, resolved from the repository root.
 """
 
 import os
@@ -13,34 +12,14 @@ from isaaclab.assets.articulation import ArticulationCfg
 from isaaclab.assets.rigid_object import RigidObjectCfg
 
 
-HOI_ROOT = os.path.realpath(
-    os.path.expanduser(os.environ.get("VAIC_HOI_ROOT", "/home/hcc/research/HOI"))
-)
-R1_USD_PATH = os.path.join(
-    HOI_ROOT,
-    "src/holosoma_retargeting/holosoma_retargeting/models",
-    "converted_rank0/r1_26dof.usd",
-)
-R1_LARGEBOX_USD_PATH = os.path.join(
-    HOI_ROOT,
-    "train_r1/objects/largebox/converted_rank0/largebox.usd",
-)
-R1_WHITECHAIR_USD_PATH = os.path.join(
-    HOI_ROOT,
-    "train_r1/objects/whitechair/converted_rank0/whitechair.usd",
-)
-R1_SMALLTABLE_USD_PATH = os.path.join(
-    HOI_ROOT,
-    "train_r1/objects/smalltable/converted_rank0/smalltable.usd",
-)
-R1_SUITCASE_USD_PATH = os.path.join(
-    HOI_ROOT,
-    "train_r1/objects/suitcase/converted_rank0/suitcase.usd",
-)
-R1_PLASTICBOX_USD_PATH = os.path.join(
-    HOI_ROOT,
-    "train_r1/objects/plasticbox/converted_rank0/plasticbox.usd",
-)
+ASSET_PATH = os.path.dirname(__file__)
+R1_DATA_PATH = os.path.join(os.path.dirname(os.path.dirname(ASSET_PATH)), "data/motion/r1")
+R1_USD_PATH = os.path.join(R1_DATA_PATH, "robot/converted_rank0/r1_26dof.usd")
+R1_LARGEBOX_USD_PATH = os.path.join(R1_DATA_PATH, "objects/largebox/converted_rank0/largebox.usd")
+R1_WHITECHAIR_USD_PATH = os.path.join(R1_DATA_PATH, "objects/whitechair/converted_rank0/whitechair.usd")
+R1_SMALLTABLE_USD_PATH = os.path.join(R1_DATA_PATH, "objects/smalltable/converted_rank0/smalltable.usd")
+R1_SUITCASE_USD_PATH = os.path.join(R1_DATA_PATH, "objects/suitcase/converted_rank0/suitcase.usd")
+R1_PLASTICBOX_USD_PATH = os.path.join(R1_DATA_PATH, "objects/plasticbox/converted_rank0/plasticbox.usd")
 
 
 # Holosoma computes these gains in its torque controller.  VAIC's action

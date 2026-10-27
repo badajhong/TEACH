@@ -170,13 +170,18 @@ Use `algo.buffer_device_type=cuda` to keep it on the GPU instead.
 R1 largebox teacher
 
 ```bash
-python scripts/train.py algo=flashsac_vel_train task=R1/TEACH/largebox_tea
+python scripts/train.py algo=flashsac_vel_train task=R1/rl/sub3_largebox_003_tea
 ```
 
-`task=G1/TEACH/largebox_tea` is an alias for this same **R1** task, so the original
-command also works. The task uses `data/motion/r1/largebox/sub3_largebox_003` and
-the existing R1/largebox USDs under `/home/hcc/research/HOI`; set `VAIC_HOI_ROOT`
-if that checkout is elsewhere.
+The other clips run the same way with `task=R1/rl/<clip>_tea`. Everything the R1 tasks
+load lives in this repository under `data/motion/r1`, resolved from the repository root:
+
+- `rl/<object>/<clip>.npz`: Holosoma clips. Run `python scripts/convert_r1_rl.py`
+  after replacing them to regenerate the `rl/<object>/<clip>/` motion directories
+  (`motion.npz` and `meta.json`) that the tasks read.
+- `robot/converted_rank0/r1_26dof.usd`: the R1 robot.
+- `objects/<object>/converted_rank0/<object>.usd`: the interaction objects, with the
+  `sample_points.npy` the converter samples object points from.
 
 - R1 has 26 simulated joints and **24 policy actions**. Its two head joints are
   held at their default position targets; R1 has no waist-pitch joint. Reference
@@ -232,7 +237,7 @@ if that checkout is elsewhere.
 For a short local training check with a small replay buffer:
 
 ```bash
-python scripts/train.py algo=flashsac_vel_train task=R1/TEACH/largebox_tea \
+python scripts/train.py algo=flashsac_vel_train task=R1/rl/sub3_largebox_003_tea \
   algo.num_envs=8 algo.train_every=8 algo.adapt_num_minibatches=2 \
   algo.buffer_max_length=512 algo.buffer_min_length=32 algo.sample_batch_size=16 \
   algo.updates_per_interaction_step=1 total_frames=256 task.max_episode_length=64 \

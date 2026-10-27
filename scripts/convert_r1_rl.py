@@ -6,7 +6,6 @@ The source archives are left intact. Each clip gets a sibling directory with
 
 import argparse
 import json
-import os
 from pathlib import Path
 
 import numpy as np
@@ -14,6 +13,7 @@ import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SOURCE_ROOT = REPO_ROOT / "data/motion/r1/rl"
+OBJECT_ROOT = REPO_ROOT / "data/motion/r1/objects"
 CONTACT_BODIES = (
     "left_ankle_roll_link", "right_ankle_roll_link",
     "left_wrist_roll_link", "left_wrist_pitch_link", "left_wrist_yaw_link",
@@ -102,10 +102,7 @@ def convert_clip(source: Path, object_root: Path) -> Path:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-root", type=Path, default=SOURCE_ROOT)
-    parser.add_argument(
-        "--object-root", type=Path,
-        default=Path(os.environ.get("VAIC_HOI_ROOT", "/home/hcc/research/HOI")) / "train_r1/objects",
-    )
+    parser.add_argument("--object-root", type=Path, default=OBJECT_ROOT)
     args = parser.parse_args()
     clips = sorted(args.source_root.glob("*/*.npz"))
     if not clips:
