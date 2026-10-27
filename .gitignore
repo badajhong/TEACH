@@ -195,3 +195,6 @@ test/
 #models
 teachers/
 diagnostics/
+
+# data
+data/motion/r1
