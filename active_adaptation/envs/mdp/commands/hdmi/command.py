@@ -369,20 +369,23 @@ class RobotTracking(Command):
         #     color=(0, 0, 1, 1)
         # )
 
-class RobotFeetContactTracking(RobotTracking):
-    """RobotTracking plus the clip's foot-ground contact labels, with no object in the scene.
+class RobotContactLabelTracking(RobotTracking):
+    """RobotTracking plus the clip's contact labels, with no object in the scene.
 
-    RobotObjectTracking loads ``feet_contact`` together with its object contact data; this
-    loads only that array, so the ``feet_contact`` reward runs on motion-only tasks. The
-    labels are indexed after ``RobotTracking.update`` the same way RobotObjectTracking does.
+    Loads two of RobotObjectTracking's per-frame motion-file labels without its object
+    assets or object state: ``feet_contact`` (foot-ground, for the ``feet_contact`` reward)
+    and the first column of ``object_contact`` (the clip's hand-object contact flag, for the
+    ``ref_contact_flag_future`` observation). Both are indexed after ``RobotTracking.update``
+    the same way RobotObjectTracking does.
     """
 
     def __init__(self, call_update: bool = True, **kwargs):
         super().__init__(**kwargs, call_update=False)
-        feet_contact = np.concatenate(
-            [np.load(path, allow_pickle=True)["feet_contact"] for path in self.dataset.motion_paths], axis=0
-        )
+        motions = [np.load(path, allow_pickle=True) for path in self.dataset.motion_paths]
+        feet_contact = np.concatenate([motion["feet_contact"] for motion in motions], axis=0)
+        object_contact = np.concatenate([motion["object_contact"] for motion in motions], axis=0)
         self._feet_contact = torch.tensor(feet_contact, device=self.device, dtype=torch.bool)
+        self._object_contact = torch.tensor(object_contact[..., :1], device=self.device, dtype=torch.bool)
         if call_update:
             self._init_debug_draw()
             self.update(advance=not self.env.real_reset_observations)
@@ -395,6 +398,8 @@ class RobotFeetContactTracking(RobotTracking):
         idx.clamp_max_(self.motion_ends.unsqueeze(1) - 1)
         self.ref_feet_contact_future = self._feet_contact[idx]
         self.ref_feet_contact = self.ref_feet_contact_future[:, 0]
+        self.ref_object_contact_future = self._object_contact[idx]
+        self.ref_object_contact = self.ref_object_contact_future[:, 0]
 
 class RobotObjectTracking(RobotTracking):
     def __init__(

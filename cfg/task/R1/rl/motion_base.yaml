@@ -48,8 +48,9 @@ action:
   alpha: [0.8, 1.0]
 
 command:
-  # RobotTracking plus the clip's foot-ground contact labels for the feet_contact reward.
-  _target_: active_adaptation.envs.mdp.commands.hdmi.command.RobotFeetContactTracking
+  # RobotTracking plus the clip's foot-ground and hand-object contact labels, read from
+  # the motion file, for the feet_contact reward and ref_contact_flag_future.
+  _target_: active_adaptation.envs.mdp.commands.hdmi.command.RobotContactLabelTracking
   root_body_name: pelvis_link
   replay_motion: false
 
@@ -96,10 +97,12 @@ command:
   init_joint_vel_noise: 0.1
 
 # tracking-base already omits object_, object_geo_ and the object/contact priv terms.
-# vel_command drops ref_contact_flag_future, which is the object-contact flag.
+# vel_command matches the _stu tasks; ref_contact_flag_future is the clip's contact
+# label, not simulated object state.
 observation:
   vel_command:
     ref_root_vel_future_b: {}
+    ref_contact_flag_future: {}
   priv:
     body_height:
       body_names: [.*_ankle_roll_link, pelvis_link, waist_yaw_link]
