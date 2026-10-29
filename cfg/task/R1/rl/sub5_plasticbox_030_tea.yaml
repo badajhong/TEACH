@@ -4,9 +4,25 @@ defaults:
   - _self_
 
 name: R1RlSub5Plasticbox030
+# The clip has 1207 frames. Play starts at frame 0, and success needs the last frame.
+max_episode_length: 1250
 
 command:
   data_path: data/motion/r1/rl/plasticbox/sub5_plasticbox_030
   contact_target_pos_offset:
     - [0.1172, -0.0823, 0.1599]
     - [0.2494, -0.0834, 0.0869]
+
+# At scale 0.5 the box surface is about 11.5 cm farther from the reference
+# pushing ankle than at 1.0, so small boxes need the foot to leave the reference.
+randomization:
+  body_scale:
+    scale_range: [0.5, 1.0]
+
+# The clip's ankle contact labels mark links within 10 cm of the box, so exact
+# tracking applies no ankle_roll force, and frames 150-244 put the left target
+# 0.27 m away. Termination params go straight to the class (null would fail),
+# so an unreachable min_steps turns lost-contact termination off. The
+# eef_contact_exp reward still encourages the push.
+termination:
+  cum_lost_contact_steps: {min_steps: 100000}

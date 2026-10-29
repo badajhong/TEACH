@@ -61,9 +61,11 @@ action:
     .*_shoulder_yaw_joint: 0.4125
     .*_elbow_joint: 0.4125
     .*_wrist_roll_joint: 0.4125
-  min_delay: 0
-  max_delay: 0
-  alpha: 1.0
+  # Same per-episode actuation DR as hdmi-base (G1): the target is delayed by
+  # 2-6 physics steps (10-30 ms at 5 ms) and low-pass filtered with alpha.
+  min_delay: 2
+  max_delay: 6
+  alpha: [0.8, 1.0]
 
 command:
   data_path: data/motion/r1/rl/largebox/sub3_largebox_003

@@ -4,6 +4,8 @@ defaults:
   - _self_
 
 name: R1RlSub5Plasticbox000
+# The clip has 1207 frames. Play starts at frame 0, and success needs the last frame.
+max_episode_length: 1250
 
 command:
   data_path: data/motion/r1/rl/plasticbox/sub5_plasticbox_000

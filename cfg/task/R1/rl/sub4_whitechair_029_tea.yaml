@@ -4,6 +4,8 @@ defaults:
   - _self_
 
 name: R1RlSub4Whitechair029
+# The clip has 1057 frames. Play starts at frame 0, and success needs the last frame.
+max_episode_length: 1100
 
 command:
   data_path: data/motion/r1/rl/whitechair/sub4_whitechair_029

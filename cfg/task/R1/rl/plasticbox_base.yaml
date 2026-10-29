@@ -6,6 +6,11 @@ defaults:
 
 name: R1RlPlasticboxBase
 
+camera_sensor:
+  # Sensor-only, invisible 2k-face copy of the box (the source mesh has 68k
+  # faces). Visual and collision meshes are unchanged; used only with cameras.
+  object_depth_proxy_usd: objects/r1_plasticbox_depth_proxy.usda
+
 command:
   data_path: data/motion/r1/rl/plasticbox/sub5_plasticbox_030
   object_asset_name: plasticbox_link
@@ -21,7 +26,14 @@ command:
     - [0.117206, -0.082348, 0.160181]
     - [0.250464, -0.083415, 0.086880]
 
+# Per-object ranges from HOI train_r1/objects/objects_parm.yaml. HOI adds its
+# mass range to the 0.1 kg URDF mass; this term sets the mass directly.
 randomization:
+  object_body_randomization:
+    static_friction_range: [0.3, 1.0]
+    dynamic_friction_range: [0.3, 1.0]
+    restitution_range: [0.0, 0.5]
+    mass_range: [0.6, 2.1]
   body_scale:
     name: plasticbox_link
     scale_range: [0.5, 1.0]

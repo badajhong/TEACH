@@ -16,7 +16,14 @@ command:
     - [-0.275948, -0.033353, 0.126038]
     - [-0.007671, -0.207861, -0.086427]
 
+# Per-object ranges from HOI train_r1/objects/objects_parm.yaml. HOI adds its
+# mass range to the 0.1 kg URDF mass; this term sets the mass directly.
 randomization:
+  object_body_randomization:
+    static_friction_range: [0.3, 2.0]
+    dynamic_friction_range: [0.3, 1.2]
+    restitution_range: [0.0, 0.5]
+    mass_range: [1.1, 2.1]
   body_scale:
     name: whitechair_link
     scale_range: [0.8, 1.1]

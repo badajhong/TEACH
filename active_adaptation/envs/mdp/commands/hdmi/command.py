@@ -369,6 +369,33 @@ class RobotTracking(Command):
         #     color=(0, 0, 1, 1)
         # )
 
+class RobotFeetContactTracking(RobotTracking):
+    """RobotTracking plus the clip's foot-ground contact labels, with no object in the scene.
+
+    RobotObjectTracking loads ``feet_contact`` together with its object contact data; this
+    loads only that array, so the ``feet_contact`` reward runs on motion-only tasks. The
+    labels are indexed after ``RobotTracking.update`` the same way RobotObjectTracking does.
+    """
+
+    def __init__(self, call_update: bool = True, **kwargs):
+        super().__init__(**kwargs, call_update=False)
+        feet_contact = np.concatenate(
+            [np.load(path, allow_pickle=True)["feet_contact"] for path in self.dataset.motion_paths], axis=0
+        )
+        self._feet_contact = torch.tensor(feet_contact, device=self.device, dtype=torch.bool)
+        if call_update:
+            self._init_debug_draw()
+            self.update(advance=not self.env.real_reset_observations)
+            if self.record_motion:
+                self.motion_frames = []
+
+    def update(self, advance=True):
+        super().update(advance=advance)
+        idx = (self.motion_starts + self.t).unsqueeze(1) + self.future_steps.unsqueeze(0)
+        idx.clamp_max_(self.motion_ends.unsqueeze(1) - 1)
+        self.ref_feet_contact_future = self._feet_contact[idx]
+        self.ref_feet_contact = self.ref_feet_contact_future[:, 0]
+
 class RobotObjectTracking(RobotTracking):
     def __init__(
         self,

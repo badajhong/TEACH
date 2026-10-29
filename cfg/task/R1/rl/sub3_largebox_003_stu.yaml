@@ -17,3 +17,21 @@ command:
   # Train cold GRU/depth initialization at the same full-motion start used in play.
   # Other resets retain random motion phases; explicit reset_range takes priority.
   full_start_probability: 0.2
+
+# G1 student depth DR (skateboard_stu). noise_std and episode_noise_range are
+# metres before the 0.1-1.5 m normalization; delay_range counts 0.02 s env steps
+# on top of the 0.1 s camera period. The code does not apply Gaussian blur yet.
+observation:
+  depth:
+    depth_camera:
+      noise_std: 0.05
+      episode_noise_range: [-0.15, 0.15]
+      delay_range: [0, 4]
+
+# G1 student per-episode camera mount and intrinsics noise. The aperture noise is
+# absolute, so on R1's 6.54-wide aperture (146 deg) it is 0.8% versus G1's 2.5%.
+camera_dr:
+  extrinsics_pos_noise_std: [0.01, 0.01, 0.01]
+  extrinsics_rot_noise_std: [0.01, 0.02, 0.01]
+  intrinsics_focal_length_noise_std: 0.02
+  intrinsics_aperture_noise_std: 0.05
