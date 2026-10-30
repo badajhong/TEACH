@@ -6,9 +6,21 @@ defaults:
 name: R1RlSub3Largebox003NoObj
 
 # Motion-only copy of sub3_largebox_003_tea: the same clip, robot rewards, terminations
-# and robot randomization, with no box in the scene. Use algo=flashsac_vel_train_no_obj.
+# and robot randomization, with no box in the scene, plus floor tilt randomization.
+# Use algo=flashsac_vel_train_no_obj.
 command:
   data_path: data/motion/r1/rl/largebox/sub3_largebox_003
+  # Floor tilt DR: every episode draws a tilt from this list and a uniformly random uphill
+  # direction (10 degree steps), on terrain=tilted_planes. Set [0.0] for a flat floor.
+  _target_: active_adaptation.envs.mdp.commands.hdmi.command.RobotTiltedFloorTracking
+  floor_tilt_degrees: [-3.0, -2.5, -2.0, -1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
+
+terrain: tilted_planes
+
+# Critic only: the actor reads algo.actor_terms.
+observation:
+  priv:
+    floor_slope_b: {}
 
 robot:
   override_params:

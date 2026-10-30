@@ -313,6 +313,15 @@ class ref_root_vel_future_b(RobotTrackObservation):
         return vel_future.reshape(N, -1)                          # [N, T*3]
 
 
+class floor_slope_b(RobotTrackObservation):
+    """Floor gradient (dz/dx, dz/dy) in the robot's yaw frame, from RobotTiltedFloorTracking."""
+    def compute(self) -> torch.Tensor:
+        grad_w = self.command_manager.floor_grad
+        grad_w = torch.cat([grad_w, torch.zeros_like(grad_w[:, :1])], dim=-1)
+        grad_b = quat_apply_inverse(yaw_quat(self.command_manager.robot_root_quat_w), grad_w)
+        return grad_b[:, :2]
+
+
 def yaw_from_quat(quat: torch.Tensor) -> torch.Tensor:
     qw, qx, qy, qz = torch.unbind(quat, dim=-1)
     yaw = torch.atan2(2 * (qw * qz + qx * qy), 1 - 2 * (qy * qy + qz * qz))

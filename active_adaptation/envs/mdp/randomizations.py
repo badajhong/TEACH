@@ -200,6 +200,14 @@ class motor_params_implicit(Randomization):
             friction = torch.rand(len(env_ids), len(self.friction_id), device=self.device) * self.friction_scale + self.friction_low
             self.asset.write_joint_friction_coefficient_to_sim(friction, self.friction_id, env_ids)
 
+        # write_joint_*_to_sim sets only the PhysX gains (IsaacLab #128). Implicit actuators
+        # estimate applied_torque from their own gains, so copy the new ones there too.
+        for actuator in self.asset.actuators.values():
+            if self.stiffness_range is not None:
+                actuator.stiffness[env_ids] = self.asset.data.joint_stiffness[env_ids][:, actuator.joint_indices]
+            if self.damping_range is not None:
+                actuator.damping[env_ids] = self.asset.data.joint_damping[env_ids][:, actuator.joint_indices]
+
 
 class random_motor_failure(Randomization):
     def __init__(
@@ -247,8 +255,14 @@ class perturb_body_materials(Randomization):
         static_friction_range = (0.6, 1.0),
         dynamic_friction_range = (0.6, 1.0),
         restitution_range=(0.0, 0.2),
-        homogeneous: bool=False
+        homogeneous: bool=False,
+        num_materials: int | None = None,
     ):
+        """num_materials: if set, each shape draws one of num_materials (static, dynamic,
+        restitution) triples sampled once, as Isaac Lab's randomize_rigid_body_material
+        does. PhysX allows at most 64K materials per scene; with the default independent
+        per-property buckets (up to 64^3 combinations) randomizing many links of many envs
+        exceeds that limit."""
         super().__init__(env)
         self.asset: Articulation = self.env.scene["robot"]
         self.body_ids, self.body_names = self.asset.find_bodies(body_names)
@@ -257,6 +271,7 @@ class perturb_body_materials(Randomization):
         self.dynamic_friction_range = dynamic_friction_range
         self.restitution_range = restitution_range
         self.homogeneous = homogeneous
+        self.num_materials = num_materials
         
         self.default_materials = (
             self.asset.root_physx_view.get_material_properties()
@@ -275,6 +290,12 @@ class perturb_body_materials(Randomization):
         self.static_friction_buckets = sample_uniform((self.num_buckets,), *self.static_friction_range)
         self.dynamic_friction_buckets = sample_uniform((self.num_buckets,), *self.dynamic_friction_range)
         self.restitution_buckets = sample_uniform((self.num_buckets,), *self.restitution_range)
+        if self.num_materials is not None:
+            self.material_buckets = torch.stack([
+                sample_uniform((self.num_materials,), *self.static_friction_range),
+                sample_uniform((self.num_materials,), *self.dynamic_friction_range),
+                sample_uniform((self.num_materials,), *self.restitution_range),
+            ], dim=-1)
 
     def startup(self):
         logging.info(f"Randomize body materials of {self.body_names} upon startup.")
@@ -284,9 +305,12 @@ class perturb_body_materials(Randomization):
             shape = (self.num_envs, 1)
         else:
             shape = (self.num_envs, len(self.shape_ids))
-        materials[:, self.shape_ids, 0] = self.static_friction_buckets[torch.randint(0, self.num_buckets, shape)]
-        materials[:, self.shape_ids, 1] = self.dynamic_friction_buckets[torch.randint(0, self.num_buckets, shape)]
-        materials[:, self.shape_ids, 2] = self.restitution_buckets[torch.randint(0, self.num_buckets, shape)]
+        if self.num_materials is not None:
+            materials[:, self.shape_ids] = self.material_buckets[torch.randint(0, self.num_materials, shape)]
+        else:
+            materials[:, self.shape_ids, 0] = self.static_friction_buckets[torch.randint(0, self.num_buckets, shape)]
+            materials[:, self.shape_ids, 1] = self.dynamic_friction_buckets[torch.randint(0, self.num_buckets, shape)]
+            materials[:, self.shape_ids, 2] = self.restitution_buckets[torch.randint(0, self.num_buckets, shape)]
 
         indices = torch.arange(self.asset.num_instances)
         self.asset.root_physx_view.set_material_properties(materials.flatten(), indices)
@@ -370,15 +394,18 @@ class perturb_body_mass(Randomization):
 
 class perturb_body_com(Randomization):
     def __init__(self, env, body_names, com_range=(-0.05, 0.05)):
+        """com_range is one (low, high) for all axes, or three of them for x, y and z (body frame)."""
         super().__init__(env)
         self.asset: Articulation = self.env.scene["robot"]
-        self.com_range = com_range
+        com_range = torch.as_tensor(com_range, dtype=torch.float32)
+        self.com_range = com_range.expand(3, 2) if com_range.ndim == 1 else com_range
         self.body_ids, self.body_names = self.asset.find_bodies(body_names)
         self.ALL_INDICES = torch.arange(self.asset.num_instances)
-    
+
     def startup(self):
         coms = self.asset.root_physx_view.get_coms()
-        rand_offset = sample_uniform((self.asset.num_instances, len(self.body_ids), 3), *self.com_range)
+        low, high = self.com_range.to(coms.device).unbind(-1)
+        rand_offset = low + (high - low) * torch.rand(self.asset.num_instances, len(self.body_ids), 3, device=coms.device)
         coms[:, self.body_ids, :3] += rand_offset
         self.asset.root_physx_view.set_coms(coms, indices=self.ALL_INDICES)
 
@@ -495,6 +522,39 @@ class push(Randomization):
             self.forces / self.default_mass_total,
             color=(1., 0.8, .4, 1.)
         )
+
+class push_by_setting_velocity(Randomization):
+    """HOI/BeyondMimic push: at random intervals, overwrite the root velocity with a random one.
+
+    Each env waits a uniform ``interval_s`` between pushes; a push sets the root (COM) velocity,
+    linear then angular in the world frame, to uniform(-max_vel, max_vel). Pushes happen only
+    while training, as in HOI.
+    """
+    def __init__(self, env, interval_s=(1.0, 3.0), max_vel=(0.5, 0.5, 0.2, 0.52, 0.52, 0.78)):
+        super().__init__(env)
+        self.asset: Articulation = self.env.scene["robot"]
+        self.interval_steps = torch.tensor(interval_s, device=self.device) / self.env.step_dt
+        self.max_vel = torch.tensor(max_vel, device=self.device)
+        self.countdown = torch.zeros(self.num_envs, device=self.device)
+
+    def _sample_countdown(self, n: int) -> torch.Tensor:
+        low, high = self.interval_steps
+        return low + (high - low) * torch.rand(n, device=self.device)
+
+    def reset(self, env_ids: torch.Tensor):
+        self.countdown[env_ids] = self._sample_countdown(len(env_ids))
+
+    def step(self, substep):
+        if substep != 0 or not self.env.training:
+            return
+        self.countdown -= 1
+        env_ids = (self.countdown <= 0).nonzero().squeeze(-1)
+        if len(env_ids) == 0:
+            return
+        velocity = (2 * torch.rand(len(env_ids), 6, device=self.device) - 1) * self.max_vel
+        self.asset.write_root_com_velocity_to_sim(velocity, env_ids=env_ids)
+        self.countdown[env_ids] = self._sample_countdown(len(env_ids))
+
 
 class drag(Randomization):
     def __init__(self, env, body_names, drag_range=(0.0, 0.1)):

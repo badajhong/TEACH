@@ -578,7 +578,9 @@ class _Env(EnvBase):
                 return_distance=False,
             )[0]
             ray_distance = 10. - (ray_hits - ray_starts).norm(dim=-1)
-            ray_distance = ray_distance.nan_to_num(10.)
+            # a missed ray hits at inf, giving -inf here; treat it like NaN rather than
+            # letting nan_to_num turn it into -3.4e38
+            ray_distance = ray_distance.nan_to_num(10., posinf=10., neginf=10.)
             assert not ray_distance.isnan().any()
             return ray_distance.reshape(*bshape)
         elif self.backend == "mujoco":

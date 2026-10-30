@@ -401,6 +401,94 @@ class RobotContactLabelTracking(RobotTracking):
         self.ref_object_contact_future = self._object_contact[idx]
         self.ref_object_contact = self.ref_object_contact_future[:, 0]
 
+class RobotTiltedFloorTracking(RobotContactLabelTracking):
+    """RobotContactLabelTracking on a planar floor whose tilt is re-sampled every episode.
+
+    Needs ``terrain: tilted_planes``: one row of tiles per tilt magnitude, one column per
+    uphill direction. Each reset draws a tilt from ``floor_tilt_degrees`` and a direction
+    uniformly, and moves the env origin to that tile's center; a negative tilt is the plane of
+    its magnitude facing the other way, so it only weights how often each magnitude is drawn.
+    The reference keeps its upright, flat-ground poses: each frame is shifted vertically by the
+    floor height under its root, and vertical velocities by the matching slope term, so the
+    policy has to adapt its feet to the incline.
+    """
+
+    def __init__(self, floor_tilt_degrees: List[float], call_update: bool = True, **kwargs):
+        super().__init__(**kwargs, call_update=False)
+        terrain = self.env.scene.terrain
+        if terrain is None or terrain.terrain_origins is None:
+            raise ValueError("RobotTiltedFloorTracking needs a generated terrain such as terrain=tilted_planes")
+        self._tile_origins = terrain.terrain_origins  # [rows, cols, 3]
+        num_rows, num_cols = self._tile_origins.shape[:2]
+
+        # Measure each tile's slope from the ground mesh, 0.5 m either side of its center.
+        offsets = torch.tensor([[0.5, 0.0, 0.0], [-0.5, 0.0, 0.0], [0.0, 0.5, 0.0], [0.0, -0.5, 0.0]], device=self.device)
+        heights = self.env.get_ground_height_at(self._tile_origins.unsqueeze(2) + offsets)
+        self._tile_grad = torch.stack([heights[..., 0] - heights[..., 1], heights[..., 2] - heights[..., 3]], dim=-1)
+        row_tilt = torch.rad2deg(torch.atan(self._tile_grad.norm(dim=-1)))
+        if (row_tilt.amax(1) - row_tilt.amin(1)).max() > 0.01:
+            raise ValueError("each terrain row must hold a single tilt")
+        row_tilt = row_tilt.mean(1)
+
+        rows = []
+        for tilt in floor_tilt_degrees:
+            match = ((row_tilt - abs(tilt)).abs() < 0.01).nonzero()
+            if len(match) == 0:
+                raise ValueError(f"floor tilt {tilt} deg has no tile row; the terrain has {row_tilt.tolist()}")
+            rows.append(match[0, 0])
+        self._tilt_rows = torch.stack(rows)
+        self.num_tile_cols = num_cols
+
+        # A clip that leaves its tile would cross onto a neighbour with another slope.
+        root_xy = self.dataset.data.body_pos_w[:, self.root_body_idx_motion, :2]
+        reach = root_xy.abs().amax().item() + self.pose_range[:2].abs().amax().item()
+        half_tile = 0.5 * min(terrain.cfg.terrain_generator.size)
+        if reach + 0.5 > half_tile:
+            raise ValueError(f"motion root reaches {reach:.2f} m from its origin; tiles of half-size {half_tile} m need 0.5 m margin")
+
+        self.floor_grad = torch.zeros(self.num_envs, 2, device=self.device)
+        self.floor_tilt_deg = torch.zeros(self.num_envs, device=self.device)
+        if call_update:
+            self._init_debug_draw()
+            self.update(advance=not self.env.real_reset_observations)
+            if self.record_motion:
+                self.motion_frames = []
+
+    def sample_init(self, env_ids: torch.Tensor) -> None:
+        choice = torch.randint(len(self._tilt_rows), (len(env_ids),), device=self.device)
+        rows = self._tilt_rows[choice]
+        cols = torch.randint(self.num_tile_cols, (len(env_ids),), device=self.device)
+        env_origins = self.env.scene.env_origins
+        env_origins[env_ids] = self._tile_origins[rows, cols]
+        self.floor_grad[env_ids] = self._tile_grad[rows, cols]
+        self.floor_tilt_deg[env_ids] = torch.rad2deg(torch.atan(self.floor_grad[env_ids].norm(dim=-1)))
+
+        super().sample_init(env_ids)
+        # The parent placed the root on the flat-ground reference; lift it onto the floor.
+        root_pose = self.asset.data.root_link_pose_w[env_ids].clone()
+        root_vel = self.asset.data.root_com_vel_w[env_ids].clone()
+        grad = self.floor_grad[env_ids]
+        root_pose[:, 2] += ((root_pose[:, :2] - env_origins[env_ids, :2]) * grad).sum(-1)
+        root_vel[:, 2] += (root_vel[:, :2] * grad).sum(-1)
+        self.asset.write_root_link_pose_to_sim(root_pose, env_ids=env_ids)
+        self.asset.write_root_com_velocity_to_sim(root_vel, env_ids=env_ids)
+
+    def update(self, advance=True):
+        super().update(advance=advance)
+        # In place, so the current-step views (ref_root_pos_w, ref_body_pos_w, ...) follow. The
+        # root velocity is a view into future_ref_motion and has no current-step view, so it is
+        # replaced instead, which leaves the clip slice flat.
+        grad = self.floor_grad[:, None, :]
+        rise = ((self.ref_root_pos_future_w[..., :2] - self.env.scene.env_origins[:, None, :2]) * grad).sum(-1)
+        climb = (self.ref_root_lin_vel_future_w[..., :2] * grad).sum(-1)
+        self.ref_root_pos_future_w[..., 2] += rise
+        self.ref_body_pos_future_w[..., 2] += rise.unsqueeze(-1)
+        self.ref_root_lin_vel_future_w = self.ref_root_lin_vel_future_w.clone()
+        self.ref_root_lin_vel_future_w[..., 2] += climb
+        self.ref_body_lin_vel_future_w[..., 2] += climb.unsqueeze(-1)
+        if self.env.backend == "isaac":
+            self.all_marker_pos_w[1] = self.ref_body_pos_w
+
 class RobotObjectTracking(RobotTracking):
     def __init__(
         self,

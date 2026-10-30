@@ -3,6 +3,7 @@ defaults:
   # Robot-only tracking: no object asset, and no object observations, rewards,
   # terminations or randomization. Everything else matches rl/base.yaml.
   - /task/base/tracking-base
+  - /task/R1/rl/robot_dr # push, kp/kd, link materials, COM
   - _self_
 
 name: R1RlMotionBase
@@ -25,7 +26,7 @@ robot:
   name: r1
   robot_type: r1_26dof
 
-# Same actions and actuation DR as rl/base.yaml.
+# Same actions as rl/base.yaml.
 action:
   fixed_joint_names: [head_pitch_joint, head_yaw_joint]
   action_scaling:
@@ -43,9 +44,7 @@ action:
     .*_shoulder_yaw_joint: 0.4125
     .*_elbow_joint: 0.4125
     .*_wrist_roll_joint: 0.4125
-  min_delay: 2
-  max_delay: 6
-  alpha: [0.8, 1.0]
+  # Action delay and low-pass filter: robot_dr.yaml.
 
 command:
   # RobotTracking plus the clip's foot-ground and hand-object contact labels, read from
@@ -176,16 +175,8 @@ reward:
       weight: 1.0
       enabled: false
 
-# Robot randomization from rl/base.yaml; body mass and joint offset come from tracking-base.
-randomization:
-  perturb_body_materials:
-    body_names: [.*ankle_roll_link, .*wrist_roll_link]
-    static_friction_range: [0.3, 1.6]
-    dynamic_friction_range: [0.3, 1.2]
-    restitution_range: [0.0, 0.2]
-  perturb_body_com:
-    body_names: [pelvis_link, waist_yaw_link]
-    com_range: [-0.02, 0.02]
+# Robot randomization lives in robot_dr.yaml (see defaults); body mass and joint offset
+# come from tracking-base.
 
 termination:
   cum_body_pos_error: {body_names: waist_yaw_link, min_steps: 25, threshold: 0.5}

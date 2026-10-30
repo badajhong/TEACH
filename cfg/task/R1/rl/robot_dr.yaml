@@ -1,0 +1,41 @@
+# @package task
+# Not a task: R1 robot domain randomization, listed after the parent base in the defaults
+# of base.yaml (object tasks) and motion_base.yaml (motion-only tasks).
+# The randomization terms are HOI's R1 teacher terms (holosoma wbt randomization) at HOI's
+# ranges. Link mass and joint offset DR come from the parent base.
+
+# Per-episode actuation DR (HOI has none): the joint target is delayed by 0-6 physics
+# steps (0-30 ms at 5 ms) and then low-pass filtered with alpha every physics step.
+# G1 (hdmi-base) uses 2-6 steps.
+action:
+  min_delay: 0
+  max_delay: 6
+  alpha: [0.8, 1.0]
+
+randomization:
+  # HOI push_randomizer_state: every 1-3 s set the root velocity to uniform(+-max_vel)
+  # (vx, vy, vz in m/s, then wx, wy, wz in rad/s, world frame). Training only.
+  push_by_setting_velocity:
+    interval_s: [1.0, 3.0]
+    max_vel: [0.5, 0.5, 0.2, 0.52, 0.52, 0.78]
+  # HOI actuator_randomizer_state: kp and kd x[0.9, 1.1] per joint, re-drawn every episode.
+  motor_params_implicit:
+    stiffness_range: {".*": [0.9, 1.1]}
+    damping_range: {".*": [0.9, 1.1]}
+  # HOI randomize_robot_rigid_body_material_startup, on every link. The VAIC floor combines
+  # by multiply with restitution 1.0, so contacts get the sampled restitution; HOI's floor
+  # has restitution 0.0, which keeps its foot-floor restitution at 0.
+  # Each shape draws one of 64 (friction, friction, restitution) triples, as HOI (Isaac Lab
+  # num_buckets=64) does: independent per-property draws on every link of 4096 envs exceed
+  # PhysX's 64K-material limit ("limit of 64K materials reached").
+  perturb_body_materials:
+    body_names: [".*"]
+    static_friction_range: [0.3, 1.6]
+    dynamic_friction_range: [0.3, 1.2]
+    restitution_range: [0.0, 0.5]
+    num_materials: 64
+  # HOI randomize_base_com_startup moves the torso COM by x +-2.5, y +-5, z +-5 cm (body
+  # frame). The pelvis COM gets the same ranges here; VAIC used +-2 cm on both before.
+  perturb_body_com:
+    body_names: [pelvis_link, waist_yaw_link]
+    com_range: [[-0.025, 0.025], [-0.05, 0.05], [-0.05, 0.05]]
